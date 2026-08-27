@@ -1,0 +1,1432 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
+<meta name="theme-color" content="#2d8c6f"/>
+<title>Семейный бюджет 💰</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>💰</text></svg>"/>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.26.2/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useMemo, useRef, createContext, useContext } = React;
+/* ═══ Theme Context ═══ */
+const ThemeCtx = createContext();
+function useTheme() { return useContext(ThemeCtx); }
+
+/* ═══ Категории расходов ═══ */
+const CATS = [
+  { id: "products", name: "Продукты", icon: "🛒", color: "#5C8768" },
+  { id: "cafe", name: "Кафе и рестораны", icon: "🍽️", color: "#BD7F4E" },
+  { id: "leisure", name: "Досуг", icon: "🎬", color: "#8577A3" },
+  { id: "transport", name: "Транспорт", icon: "🚗", color: "#5C82A6" },
+  { id: "rent", name: "Оплата жилья", icon: "🏠", color: "#A08857" },
+  { id: "utilities", name: "Оплата коммуналки", icon: "💡", color: "#5C8F8F" },
+  { id: "clothes", name: "Одежда", icon: "👕", color: "#AD7A8A" },
+  { id: "other", name: "Другое", icon: "📦", color: "#8B93A0" },
+];
+
+/* ═══ Валюты ═══ */
+const CURRENCIES = [
+  { code: "RUB", symbol: "₽", name: "Рубль" },
+  { code: "USD", symbol: "$", name: "Доллар" },
+  { code: "CNY", symbol: "¥", name: "Юань" },
+  { code: "VND", symbol: "₫", name: "Донг" },
+];
+const curInfo = code => CURRENCIES.find(c => c.code === code) || CURRENCIES[0];
+
+const PAL = [
+  { bg: "#E8EFEA", text: "#2E4A38", accent: "#0B6E4F", ring: "#A9C9B6", bgD: "#182620", textD: "#8FBDA0", },
+  { bg: "#F2E8DE", text: "#5C4530", accent: "#B0774A", ring: "#DCC0A2", bgD: "#2A2019", textD: "#D4A97E" },
+  { bg: "#E9E6F0", text: "#443A5C", accent: "#7A6C9C", ring: "#C6BBDA", bgD: "#211D2C", textD: "#B3A6CC" },
+  { bg: "#E4EBF1", text: "#2E4258", accent: "#5A7C99", ring: "#B4CADA", bgD: "#1A2530", textD: "#9BBAD3" },
+  { bg: "#EFE6E9", text: "#5C3A44", accent: "#A46B7A", ring: "#DAB9C2", bgD: "#291D21", textD: "#CE9FAB" },
+  { bg: "#E7EBE4", text: "#3C4A38", accent: "#7C9370", ring: "#C2D0B8", bgD: "#1E241B", textD: "#A9C09C" },
+];
+
+const WD = ["Пн","Вт","Ср","Чт","Пт","Сб","Вс"];
+const MN = ["Январь","Февраль","Март","Апрель","Май","Июнь","Июль","Август","Сентябрь","Октябрь","Ноябрь","Декабрь"];
+
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2,7);
+const fmt = (n,d=0) => new Intl.NumberFormat("ru-RU",{minimumFractionDigits:d,maximumFractionDigits:d}).format(Number(n)||0);
+const pct = (a,b) => b ? Math.round(a/b*100) : 0;
+const wdi = ds => (new Date(ds).getDay()+6)%7;
+const wn = ds => { const d=new Date(ds),s=new Date(d.getFullYear(),0,1); return Math.ceil(((d-s)/864e5+s.getDay())/7); };
+const todayStr = () => new Date().toISOString().slice(0,10);
+
+function gpal(m, dark) {
+  const p = PAL[m.ci % 6];
+  return dark ? { bg: p.bgD, text: p.textD, accent: p.accent, ring: p.ring } : p;
+}
+
+/* ═══════════════════════════════════════════════════════
+   FIFO-логика партий валюты: покупаем донги/доллары и т.п.
+   отдельными партиями, каждая трата в этой валюте съедает
+   партии по очереди — как только одна закончилась, дальше
+   считаем по курсу следующей.
+   ═══════════════════════════════════════════════════════ */
+function effRate(lot) {
+  // рублей за 1 единицу купленной валюты
+  if (!lot.midCurrency || lot.midCurrency === "RUB") {
+    // прямая покупка за рубли: rateDirect — сколько рублей за 1 единицу валюты (обычная котировка курса)
+    return lot.rateDirect || 0;
+  }
+  // через промежуточную валюту (USD или CNY): rateMidRub — курс промежуточной к рублю,
+  // rateCurPerMid — сколько купленной валюты за 1 единицу промежуточной
+  return (lot.rateCurPerMid || 0) > 0 ? (lot.rateMidRub || 0) / lot.rateCurPerMid : 0;
+}
+function buildFifoIndex(purchases) {
+  const byCur = {};
+  [...purchases].filter(p=>p.currency!=="RUB").sort((a,b)=>a.date.localeCompare(b.date)||(a.createdAt||0)-(b.createdAt||0))
+    .forEach(p=>{
+      if(!byCur[p.currency]) byCur[p.currency]=[];
+      const cumFrom = byCur[p.currency].length ? byCur[p.currency][byCur[p.currency].length-1].cumTo : 0;
+      byCur[p.currency].push({...p, cumFrom, cumTo: cumFrom + (p.amount||0), rate: effRate(p)});
+    });
+  return byCur;
+}
+function rateForSpend(currency, fifoIdx, cumSpentAfter) {
+  const lots = fifoIdx[currency] || [];
+  const lot = lots.find(l => l.cumTo >= cumSpentAfter);
+  if (lot) return { rate: lot.rate, insufficient: false };
+  const last = lots[lots.length-1];
+  return { rate: last ? last.rate : 0, insufficient: true };
+}
+// Сколько единиц КОШЕЛЬКА "съедает" расход: если платили в той же валюте — 1:1,
+// если платили в другой (напр. кошелёк $, оплата в донгах картой) — через введённый/подтянутый кросс-курс.
+function walletAmount(e) {
+  const wallet = e.walletCurrency || e.currency || "RUB";
+  const spend = e.currency || "RUB";
+  if (wallet === spend) return e.amount || 0;
+  const rate = e.conversionRate || 0; // сколько spend-валюты за 1 единицу wallet-валюты
+  return rate > 0 ? (e.amount || 0) / rate : 0;
+}
+// возвращает {id -> {rub, rate, insufficient}} для всех расходов, в порядке даты/создания
+function buildRubMap(expenses, fifoIdx) {
+  const order = [...expenses].sort((a,b)=>(a.date||"").localeCompare(b.date||"")||(a.createdAt||0)-(b.createdAt||0));
+  const cum = {}; const map = {};
+  order.forEach(e=>{
+    const wallet = e.walletCurrency || e.currency || "RUB";
+    if (wallet === "RUB") { map[e.id] = { rub: e.amount||0, rate: 1, insufficient:false }; return; }
+    const wa = walletAmount(e);
+    const before = cum[wallet] || 0;
+    const after = before + wa;
+    const r = rateForSpend(wallet, fifoIdx, after);
+    cum[wallet] = after;
+    map[e.id] = { rub: wa * r.rate, rate: r.rate, insufficient: r.insufficient };
+  });
+  return map;
+}
+function currencyBalance(currency, purchases, expenses) {
+  const bought = purchases.filter(p=>p.currency===currency).reduce((s,p)=>s+(p.amount||0),0);
+  const spent = expenses.filter(e=>(e.walletCurrency||e.currency)===currency).reduce((s,e)=>s+walletAmount(e),0);
+  return { bought, spent, rest: bought - spent };
+}
+// РУБлёвая стоимость остатка кошелька — по курсу ПОКУПКИ ещё не потраченных партий (FIFO)
+function walletRestRubValue(currency, purchases, spentTotal) {
+  const idx = buildFifoIndex(purchases);
+  const lots = idx[currency] || [];
+  let rub = 0;
+  lots.forEach(lot=>{
+    let remaining;
+    if (spentTotal <= lot.cumFrom) remaining = lot.amount;
+    else if (spentTotal >= lot.cumTo) remaining = 0;
+    else remaining = lot.cumTo - spentTotal;
+    rub += remaining * lot.rate;
+  });
+  return rub;
+}
+
+function periodRange(period, from, to) {
+  const today = todayStr();
+  const d = new Date();
+  if (period === "week") { const f = new Date(d); f.setDate(f.getDate()-6); return [f.toISOString().slice(0,10), today]; }
+  if (period === "month") { const f = new Date(d.getFullYear(), d.getMonth(), 1); return [f.toISOString().slice(0,10), today]; }
+  if (period === "quarter") { const f = new Date(d); f.setMonth(f.getMonth()-3); return [f.toISOString().slice(0,10), today]; }
+  if (period === "year") { const f = new Date(d); f.setFullYear(f.getFullYear()-1); return [f.toISOString().slice(0,10), today]; }
+  return [from || today, to || today];
+}
+function bucketKey(ds, format) {
+  if (format === "day") return ds;
+  if (format === "week") return `${new Date(ds).getFullYear()}-Н${wn(ds)}`;
+  return ds.slice(0,7);
+}
+function bucketLabel(key, format) {
+  if (format === "day") return new Date(key).toLocaleDateString("ru-RU",{day:"2-digit",month:"2-digit"});
+  if (format === "week") return key.includes("-Н") ? key.split("-Н")[1] : key;
+  return new Date(key+"-01").toLocaleDateString("ru-RU",{month:"short",year:"2-digit"});
+}
+function buildBuckets(expenses, format, getRub, from, to) {
+  const m = {};
+  expenses.forEach(e=>{ const k=bucketKey(e.date, format); m[k]=(m[k]||0)+getRub(e); });
+  if (format === "day" && from && to) {
+    // заполняем пропуски нулями, чтобы дни без трат тоже занимали своё место на графике
+    let cur = new Date(from); const end = new Date(to);
+    while (cur <= end) {
+      const k = cur.toISOString().slice(0,10);
+      if (!(k in m)) m[k] = 0;
+      cur.setDate(cur.getDate()+1);
+    }
+  }
+  return Object.keys(m).sort().map(k=>({key:k, label:bucketLabel(k,format), value:m[k]}));
+}
+
+/* ═══ Donut ═══ */
+function Donut({slices,size=160,label,sub}){
+  const tot=slices.reduce((s,x)=>s+x.value,0)||1;
+  let cum=0;const r=56,cx=80,cy=80,sw=18,C=2*Math.PI*r;
+  return(
+    <svg width={size} height={size} viewBox="0 0 160 160">
+      <circle cx={cx} cy={cy} r={r} fill="none" stroke="var(--bg3)" strokeWidth={sw}/>
+      {slices.map((sl,i)=>{const p=sl.value/tot,dash=p*C,off=-cum*C;cum+=p;
+        return <circle key={i} cx={cx} cy={cy} r={r} fill="none" stroke={sl.color} strokeWidth={sw} strokeLinecap="round"
+          strokeDasharray={`${dash} ${C-dash}`} strokeDashoffset={off}
+          transform={`rotate(-90 ${cx} ${cy})`} style={{transition:"all .7s cubic-bezier(.4,0,.2,1)"}}/>;
+      })}
+      <text x={cx} y={cy-3} textAnchor="middle" fill="var(--t1)" fontSize="18" fontWeight="800" fontFamily="'Inter',sans-serif">{label}</text>
+      {sub&&<text x={cx} y={cy+15} textAnchor="middle" fill="var(--t3)" fontSize="11" fontFamily="'Inter',sans-serif">{sub}</text>}
+    </svg>
+  );
+}
+
+/* ═══ BubbleDonut — категории «плавающими» бабблами вокруг кольца (как у Spendee) ═══ */
+function BubbleDonut({slices}){
+  const tot=slices.reduce((s,x)=>s+x.value,0)||1;
+  const cx=200,cy=200,r=85,sw=24,C=2*Math.PI*r,bubR=22,bubDist=r+40,labelDist=bubDist+bubR+20;
+  let cum=0;
+  const withMeta = slices.map(sl=>{
+    const frac=sl.value/tot;
+    const midFrac = cum+frac/2;
+    cum+=frac;
+    return {...sl, frac, angle: midFrac*2*Math.PI-Math.PI/2};
+  });
+  cum=0;
+  return(
+    <svg viewBox="0 0 400 400" width="100%" style={{maxWidth:380,display:"block",margin:"0 auto"}}>
+      <circle cx={cx} cy={cy} r={r} fill="none" stroke="var(--bg3)" strokeWidth={sw}/>
+      {slices.map((sl,i)=>{const p=sl.value/tot,dash=p*C,off=-cum*C;cum+=p;
+        return <circle key={i} cx={cx} cy={cy} r={r} fill="none" stroke={sl.color} strokeWidth={sw}
+          strokeDasharray={`${dash} ${C-dash}`} strokeDashoffset={off}
+          transform={`rotate(-90 ${cx} ${cy})`} style={{transition:"all .7s cubic-bezier(.4,0,.2,1)"}}/>;
+      })}
+      {withMeta.map((sl,i)=>{
+        const ex=cx+Math.cos(sl.angle)*r, ey=cy+Math.sin(sl.angle)*r;
+        const bx=cx+Math.cos(sl.angle)*bubDist, by=cy+Math.sin(sl.angle)*bubDist;
+        const lx=cx+Math.cos(sl.angle)*labelDist, ly=cy+Math.sin(sl.angle)*labelDist;
+        const anchor = Math.cos(sl.angle)>0.2?"start":Math.cos(sl.angle)<-0.2?"end":"middle";
+        return(<g key={i}>
+          <line x1={ex} y1={ey} x2={bx} y2={by} stroke={sl.color} strokeWidth={1.5} opacity={.5}/>
+          <circle cx={bx} cy={by} r={bubR} fill={sl.color}/>
+          <text x={bx} y={by+7} textAnchor="middle" fontSize="19" fontFamily="'Inter',sans-serif">{sl.icon}</text>
+          <text x={lx} y={ly+6} textAnchor={anchor} fontSize="18" fontWeight="800" fill={sl.color} fontFamily="'Inter',sans-serif">{Math.round(sl.frac*100)}%</text>
+        </g>);
+      })}
+    </svg>
+  );
+}
+function CategoryOverviewCard({catBD, conv, dSym}){
+  return(
+    <C$>
+      <div style={{fontSize:16,fontWeight:800,color:"var(--t1)",marginBottom:18}}>Категории</div>
+      <BubbleDonut slices={catBD.map(c=>({value:c.value,color:c.color,icon:c.icon}))}/>
+      <div style={{marginTop:22,display:"flex",flexDirection:"column",gap:4}}>
+        {catBD.map(c=>(
+          <div key={c.id} style={{display:"flex",alignItems:"center",gap:14,padding:"10px 0",borderBottom:"1px solid var(--border)"}}>
+            <div style={{width:44,height:44,borderRadius:14,background:c.color+"18",display:"grid",placeItems:"center",fontSize:20,flexShrink:0}}>{c.icon}</div>
+            <div style={{flex:1,minWidth:0}}>
+              <div style={{fontSize:15,fontWeight:700,color:"var(--t1)"}}>{c.name}</div>
+              <div style={{fontSize:12,color:"var(--t3)"}}>{c.count} {c.count===1?"операция":c.count<5?"операции":"операций"}</div>
+            </div>
+            <div style={{fontSize:15,fontWeight:700,color:"var(--danger)",whiteSpace:"nowrap"}}>-{fmt(conv(c.value))} {dSym}</div>
+          </div>
+        ))}
+      </div>
+    </C$>
+  );
+}
+
+/* ═══ Card ═══ */
+function C$({children,style,onClick,className}){
+  return <div onClick={onClick} className={className} style={{background:"var(--card)",borderRadius:12,padding:18,border:"1px solid var(--border)",boxShadow:"var(--card-sh)",transition:"border-color .2s",...style}}>{children}</div>;
+}
+
+/* ═══ Modal — по центру на десктопе, шторкой снизу на мобильном (как веб/моб. версии Monarch) ═══ */
+function Modal({open,onClose,title,children}){
+  if(!open) return null;
+  return(
+    <div onClick={onClose} className="modal-overlay" style={{position:"fixed",inset:0,zIndex:1000,background:"rgba(15,18,23,.45)",display:"flex",alignItems:"flex-end",justifyContent:"center",animation:"fadeIn .2s"}}>
+      <div onClick={e=>e.stopPropagation()} className="modal-box" style={{background:"var(--card)",border:"1px solid var(--border)",width:"100%",maxWidth:480,maxHeight:"90vh",overflowY:"auto",padding:"22px 20px 30px",animation:"slideUp .3s cubic-bezier(.32,.72,.24,1)"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
+          <h3 style={{margin:0,fontSize:16,fontWeight:700,color:"var(--t1)"}}>{title}</h3>
+          <button onClick={onClose} className="btn-icon">✕</button>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+const IS={width:"100%",padding:"10px 12px",borderRadius:8,fontSize:14,border:"1px solid var(--border)",background:"var(--input)",color:"var(--t1)",boxSizing:"border-box",outline:"none",fontFamily:"inherit",transition:"border-color .2s"};
+
+/* ═══ Поле числа с разделителями разрядов (3 000 000) — показывает форматированное значение,
+   пока не в фокусе; при вводе — обычные цифры, без прыжков курсора ═══ */
+function formatThousands(n){
+  if(n===""||n==null||isNaN(Number(n))) return "";
+  const parts = String(n).split(".");
+  parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g," ");
+  return parts.join(",");
+}
+function NumberInput({value,onChange,placeholder,style,inputMode}){
+  const[focused,setFocused]=useState(false);
+  const display = focused ? (value??"") : formatThousands(value);
+  return <input
+    type="text"
+    inputMode={inputMode||"decimal"}
+    value={display}
+    placeholder={placeholder}
+    style={style}
+    onFocus={()=>setFocused(true)}
+    onBlur={()=>setFocused(false)}
+    onChange={e=>{
+      let raw = e.target.value.replace(/[^\d.,\-]/g,"").replace(",",".");
+      const firstDot = raw.indexOf(".");
+      if(firstDot!==-1) raw = raw.slice(0,firstDot+1) + raw.slice(firstDot+1).replace(/\./g,"");
+      onChange({target:{value:raw}});
+    }}
+  />;
+}
+const LS={fontSize:11,fontWeight:600,color:"var(--t3)",marginBottom:6,display:"block",textTransform:"uppercase",letterSpacing:".04em"};
+
+
+/* ═══ Calendar ═══ */
+function CalendarPicker({value,onChange}){
+  const dark = useTheme();
+  const[open,setOpen]=useState(false);
+  const parsed=value?new Date(value):new Date();
+  const[vY,setVY]=useState(parsed.getFullYear());
+  const[vM,setVM]=useState(parsed.getMonth());
+  const ref=useRef(null);
+  useEffect(()=>{if(open){setVY(parsed.getFullYear());setVM(parsed.getMonth());}},[open]);
+  useEffect(()=>{if(!open)return;const h=e=>{if(ref.current&&!ref.current.contains(e.target))setOpen(false);};document.addEventListener("mousedown",h);document.addEventListener("touchstart",h);return()=>{document.removeEventListener("mousedown",h);document.removeEventListener("touchstart",h);};},[open]);
+  const today=new Date(),todayS=today.toISOString().slice(0,10);
+  const yest=new Date(today);yest.setDate(yest.getDate()-1);const yestS=yest.toISOString().slice(0,10);
+  const pick=ds=>{onChange(ds);setOpen(false);};
+  const pMo=()=>{if(vM===0){setVM(11);setVY(vY-1);}else setVM(vM-1);};
+  const nMo=()=>{if(vM===11){setVM(0);setVY(vY+1);}else setVM(vM+1);};
+  const fd=new Date(vY,vM,1),sw=(fd.getDay()+6)%7,dim=new Date(vY,vM+1,0).getDate(),pdm=new Date(vY,vM,0).getDate();
+  const cells=[];
+  for(let i=0;i<sw;i++)cells.push({day:pdm-sw+1+i,out:true});
+  for(let i=1;i<=dim;i++)cells.push({day:i,out:false,ds:`${vY}-${String(vM+1).padStart(2,"0")}-${String(i).padStart(2,"0")}`});
+  const rm=7-cells.length%7;if(rm<7)for(let i=1;i<=rm;i++)cells.push({day:i,out:true});
+  const disp=value?new Date(value).toLocaleDateString("ru-RU",{day:"numeric",month:"short",year:"numeric"}):"Выберите дату";
+  return(
+    <div ref={ref} style={{position:"relative"}}>
+      <button type="button" onClick={()=>setOpen(!open)} style={{...IS,textAlign:"left",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"space-between",color:value?"var(--t1)":"var(--t3)"}}>
+        <span>{disp}</span><span style={{fontSize:15,opacity:.5}}>📅</span>
+      </button>
+      {open&&(
+        <div style={{position:"absolute",top:"calc(100% + 8px)",left:0,right:0,zIndex:200,background:"var(--card)",borderRadius:20,boxShadow:"0 8px 40px rgba(0,0,0,.18)",padding:16,animation:"calOpen .25s ease",minWidth:280}}>
+          <div style={{display:"flex",gap:6,marginBottom:14}}>
+            {[[todayS,"Сегодня"],[yestS,"Вчера"]].map(([v,l])=>(
+              <button key={v} type="button" onClick={()=>pick(v)} style={{flex:1,padding:"9px 0",borderRadius:12,fontSize:13,fontWeight:700,border:value===v?"2px solid var(--accent)":"1.5px solid var(--border)",background:value===v?"var(--accent-soft)":"var(--input)",color:value===v?"var(--accent)":"var(--t2)",cursor:"pointer",fontFamily:"inherit"}}>{l}</button>
+            ))}
+          </div>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12}}>
+            <button type="button" onClick={pMo} className="btn-icon" style={{width:32,height:32}}>‹</button>
+            <span style={{fontWeight:700,fontSize:14,color:"var(--t1)"}}>{MN[vM]} {vY}</span>
+            <button type="button" onClick={nMo} className="btn-icon" style={{width:32,height:32}}>›</button>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:2,marginBottom:4}}>
+            {WD.map(d=><div key={d} style={{textAlign:"center",fontSize:10,fontWeight:700,color:"var(--t3)",padding:"4px 0"}}>{d}</div>)}
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:2}}>
+            {cells.map((c,i)=>{const sel=!c.out&&c.ds===value;const isT=!c.out&&c.ds===todayS;
+              return <button type="button" key={i} disabled={c.out} onClick={()=>!c.out&&pick(c.ds)} style={{width:"100%",aspectRatio:"1",borderRadius:12,border:"none",fontSize:13,fontWeight:sel||isT?700:500,background:sel?"var(--accent)":isT?"var(--accent-soft)":"transparent",color:c.out?"var(--t4)":sel?"#fff":isT?"var(--accent)":"var(--t1)",cursor:c.out?"default":"pointer",transition:"all .15s",display:"grid",placeItems:"center"}}>{c.day}</button>;
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ═══ Onboarding ═══ */
+function Onboarding({onDone}){
+  const[names,setNames]=useState(["",""]);
+  const[budget,setBudget]=useState("50000");
+  const upd=(i,v)=>{const c=[...names];c[i]=v;setNames(c);};
+  const ok=names.some(n=>n.trim())&&budget;
+  return(
+    <div style={{maxWidth:460,width:"100%",textAlign:"center"}}>
+      <div style={{width:72,height:72,borderRadius:20,background:"var(--accent)",display:"grid",placeItems:"center",margin:"0 auto 16px",boxShadow:"0 8px 24px var(--accent-glow)"}}>
+        <span style={{fontSize:32,filter:"brightness(10)"}}>💰</span>
+      </div>
+      <h1 style={{fontSize:28,fontWeight:800,marginBottom:4,color:"var(--t1)",letterSpacing:"-.03em"}}>Семейный бюджет</h1>
+      <p style={{color:"var(--t3)",marginBottom:32,fontSize:14,lineHeight:1.6}}>Добавьте участников и установите месячный бюджет</p>
+      <C$ style={{textAlign:"left"}}>
+        <label style={LS}>Участники</label>
+        {names.map((n,i)=>(
+          <div key={i} style={{display:"flex",gap:10,marginBottom:10,alignItems:"center"}}>
+            <div style={{width:42,height:42,borderRadius:14,flexShrink:0,background:PAL[i%6].bg,color:PAL[i%6].text,display:"grid",placeItems:"center",fontWeight:700,fontSize:14}}>{n.trim()?n.trim().slice(0,2).toUpperCase():"?"}</div>
+            <input value={n} onChange={e=>upd(i,e.target.value)} placeholder={`Участник ${i+1}`} style={{...IS,flex:1,width:"auto"}}/>
+            {names.length>1&&<button onClick={()=>setNames(names.filter((_,j)=>j!==i))} className="btn-icon">✕</button>}
+          </div>
+        ))}
+        {names.length<6&&<button onClick={()=>setNames([...names,""])} style={{width:"100%",padding:12,borderRadius:14,border:"2px dashed var(--border)",background:"transparent",cursor:"pointer",color:"var(--t3)",fontWeight:600,fontSize:13,marginTop:4,fontFamily:"inherit"}}>+ Добавить</button>}
+        <div style={{marginTop:20}}>
+          <label style={LS}>Месячный бюджет (₽)</label>
+          <NumberInput value={budget} onChange={e=>setBudget(e.target.value)} style={IS}/>
+        </div>
+        <button disabled={!ok} onClick={()=>onDone(names.filter(n=>n.trim()),Number(budget)||50000)} className="btn-primary" style={{marginTop:20,opacity:ok?1:.5}}>Начать</button>
+      </C$>
+    </div>
+  );
+}
+
+/* ═══ Chip выбора валюты ═══ */
+function CurrencyChips({value,onChange,exclude}){
+  const list = CURRENCIES.filter(c=>!exclude || !exclude.includes(c.code));
+  return(
+    <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+      {list.map(c=>{const s=c.code===value;
+        return <button key={c.code} type="button" onClick={()=>onChange(c.code)} style={{padding:"9px 14px",borderRadius:12,border:s?"2px solid var(--accent)":"1.5px solid var(--border)",background:s?"var(--accent-soft)":"var(--input)",color:s?"var(--accent)":"var(--t2)",cursor:"pointer",fontWeight:700,fontSize:13,fontFamily:"inherit"}}>{c.symbol} {c.code}</button>;
+      })}
+    </div>
+  );
+}
+
+/* ═══ Форма расхода/дохода ═══ */
+function ExpenseForm({members,expense,defaultCurrency,wallets,onSave,onDelete,onClose}){
+  const dark = useTheme();
+  const ed=!!expense;
+  const[memberId,setMemberId]=useState(expense?.memberId||members[0]?.id||"");
+  const[categoryId,setCategoryId]=useState(expense?.categoryId||"");
+  const[desc,setDesc]=useState(expense?.desc||"");
+  const[amount,setAmount]=useState(expense?.amount?.toString()||"");
+  const[currency,setCurrency]=useState(expense?.currency||defaultCurrency||"RUB");
+  const[walletCurrency,setWalletCurrency]=useState(expense?.walletCurrency||expense?.currency||defaultCurrency||"RUB");
+  const[conversionRate,setConversionRate]=useState(expense?.conversionRate?.toString()||"");
+  const[rateLoading,setRateLoading]=useState(false);
+  const[date,setDate]=useState(expense?.date||todayStr());
+  const[type,setType]=useState(expense?.type||"expense");
+  const[note,setNote]=useState(expense?.note||"");
+  const[splitOn,setSplitOn]=useState(!!expense?.split);
+  const others = members.filter(m=>m.id!==memberId);
+  const[selOthers,setSelOthers]=useState(()=>{
+    if(expense?.split) return Object.keys(expense.split.shares||{});
+    return others.length ? [others[0].id] : [];
+  });
+  const[splitMode,setSplitMode]=useState(expense?.split?.mode||"equal");
+  const[customShares,setCustomShares]=useState(expense?.split?.shares||{});
+
+  // при смене валюты платежа подбираем разумный кошелёк по умолчанию:
+  // тот же код, если по нему есть покупки, иначе — кошелёк с наибольшим остатком
+  useEffect(()=>{
+    if(ed) return; // не трогаем при редактировании существующей записи
+    const sameWallet = wallets.find(w=>w.code===currency);
+    if(sameWallet){ setWalletCurrency(currency); return; }
+    const best = [...wallets].filter(w=>w.rest>0).sort((a,b)=>b.rest-a.rest)[0];
+    setWalletCurrency(best ? best.code : currency);
+  },[currency]);
+
+  const fetchRate = async () => {
+    if(walletCurrency===currency) return;
+    setRateLoading(true);
+    try{
+      const res = await fetch(`https://open.er-api.com/v6/latest/${walletCurrency}`);
+      const d = await res.json();
+      if(d.rates && d.rates[currency]) setConversionRate(String(Math.round(d.rates[currency]*10000)/10000));
+    }catch(e){ /* тихо игнорируем — просто не подставится, курс введут вручную */ }
+    setRateLoading(false);
+  };
+  useEffect(()=>{
+    if(type==="expense" && walletCurrency!==currency && !conversionRate && !ed) fetchRate();
+  },[walletCurrency,currency]);
+
+  const cur = curInfo(currency);
+  const walCur = curInfo(walletCurrency);
+  const cat=CATS.find(c=>c.id===categoryId);
+  const needsRate = type==="expense" && walletCurrency!==currency;
+  const ok=memberId&&categoryId&&amount&&date&&(!needsRate||Number(conversionRate)>0);
+  const amt = Number(amount)||0;
+  const perHead = selOthers.length ? amt/(selOthers.length+1) : amt;
+
+  const toggleOther = id => setSelOthers(s => s.includes(id) ? s.filter(x=>x!==id) : [...s,id]);
+
+  const buildSplit = () => {
+    if (!splitOn || !selOthers.length) return null;
+    const shares = {};
+    const settled = expense?.split?.settled || {};
+    selOthers.forEach(id => {
+      shares[id] = splitMode==="equal" ? perHead : (Number(customShares[id])||0);
+      if (!(id in settled)) settled[id] = false;
+    });
+    return { participantIds: [memberId, ...selOthers], mode: splitMode, shares, settled };
+  };
+
+  return(
+    <div style={{display:"flex",flexDirection:"column",gap:16}}>
+      <div>
+        <label style={LS}>Кто потратил</label>
+        <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+          {members.map(m=>{const p=gpal(m,dark);const s=m.id===memberId;
+            return <button key={m.id} onClick={()=>setMemberId(m.id)} style={{padding:"10px 18px",borderRadius:14,border:s?`2px solid ${p.accent}`:"1.5px solid var(--border)",background:s?p.bg:"var(--input)",color:s?p.text:"var(--t2)",cursor:"pointer",fontWeight:700,fontSize:13,fontFamily:"inherit",transition:"all .2s"}}>{m.name}</button>;
+          })}
+        </div>
+      </div>
+      <div>
+        <label style={LS}>Тип</label>
+        <div style={{display:"flex",gap:8}}>
+          {[["expense","Расход","var(--danger)","var(--danger-soft)"],["income","Доход","var(--accent)","var(--accent-soft)"]].map(([v,l,ac,bg])=>(
+            <button key={v} onClick={()=>{setType(v);if(v==="income")setCurrency("RUB");}} style={{flex:1,padding:"11px 0",borderRadius:14,border:type===v?`2px solid ${ac}`:"1.5px solid var(--border)",background:type===v?bg:"var(--input)",color:type===v?ac:"var(--t2)",cursor:"pointer",fontWeight:700,fontSize:14,fontFamily:"inherit"}}>{l}</button>
+          ))}
+        </div>
+      </div>
+      <div>
+        <label style={LS}>Статья</label>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(90px,1fr))",gap:6}}>
+          {CATS.map(c=>{const s=c.id===categoryId;
+            return <button key={c.id} onClick={()=>setCategoryId(c.id)} style={{padding:"12px 4px",borderRadius:14,border:s?`2px solid ${c.color}`:"1.5px solid var(--border)",background:s?c.color+"18":"var(--input)",cursor:"pointer",fontWeight:600,fontSize:11,fontFamily:"inherit",color:s?c.color:"var(--t2)",transition:"all .15s",display:"flex",flexDirection:"column",alignItems:"center",gap:3}}>
+              <span style={{fontSize:20}}>{c.icon}</span><span>{c.name}</span></button>;
+          })}
+        </div>
+      </div>
+      {type==="expense" && <div>
+        <label style={LS}>Валюта платежа</label>
+        <CurrencyChips value={currency} onChange={setCurrency}/>
+      </div>}
+      {type==="expense" && wallets.length>0 && <div>
+        <label style={LS}>Списывается с кошелька</label>
+        <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+          {[...new Set([currency,...wallets.map(w=>w.code)])].map(cc=>{const w=wallets.find(x=>x.code===cc);const s=cc===walletCurrency;const info=curInfo(cc);
+            return <button key={cc} type="button" onClick={()=>setWalletCurrency(cc)} style={{padding:"9px 14px",borderRadius:12,border:s?"2px solid var(--accent)":"1.5px solid var(--border)",background:s?"var(--accent-soft)":"var(--input)",color:s?"var(--accent)":"var(--t2)",cursor:"pointer",fontWeight:700,fontSize:12,fontFamily:"inherit"}}>{info.symbol} {cc}{w?` · ост. ${fmt(w.rest)}`:""}</button>;
+          })}
+        </div>
+        {needsRate && <div style={{marginTop:10}}>
+          <label style={LS}>Курс {cur.symbol} за 1 {walCur.symbol} (на момент оплаты)</label>
+          <div style={{display:"flex",gap:8}}>
+            <NumberInput value={conversionRate} onChange={e=>setConversionRate(e.target.value)} placeholder="напр. 26100" style={{...IS,flex:1}}/>
+            <button type="button" onClick={fetchRate} className="btn-icon" style={{width:"auto",padding:"0 14px",fontWeight:700,fontSize:12}} disabled={rateLoading}>{rateLoading?"…":"⟳ курс"}</button>
+          </div>
+          <div style={{fontSize:11,color:"var(--t3)",marginTop:4}}>Подтягивается автоматически по межбанковскому курсу — если платили картой Mastercard/UnionPay, поправьте на реальный курс с чека, если отличается.</div>
+        </div>}
+      </div>}
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+        <div><label style={LS}>Сумма ({cur.symbol})</label><NumberInput value={amount} onChange={e=>setAmount(e.target.value)} placeholder="0" style={IS} inputMode="decimal"/></div>
+        <div><label style={LS}>Дата</label><CalendarPicker value={date} onChange={setDate}/></div>
+      </div>
+      <div><label style={LS}>Описание</label><input value={desc} onChange={e=>setDesc(e.target.value)} placeholder="Пятёрочка, бизнес-ланч..." style={IS}/></div>
+      <div><label style={LS}>Примечание</label><input value={note} onChange={e=>setNote(e.target.value)} style={IS}/></div>
+
+      {type==="expense" && others.length>0 && (
+        <C$ style={{padding:14,background:"var(--bg2)"}}>
+          <label style={{...LS,display:"flex",alignItems:"center",gap:8,cursor:"pointer"}}>
+            <input type="checkbox" checked={splitOn} onChange={e=>setSplitOn(e.target.checked)} style={{width:16,height:16}}/>
+            Разделить с другими участниками
+          </label>
+          {splitOn && <div style={{marginTop:10}}>
+            <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:10}}>
+              {others.map(m=>{const s=selOthers.includes(m.id);
+                return <button key={m.id} type="button" onClick={()=>toggleOther(m.id)} style={{padding:"8px 14px",borderRadius:12,border:s?"2px solid var(--accent)":"1.5px solid var(--border)",background:s?"var(--accent-soft)":"var(--input)",color:s?"var(--accent)":"var(--t2)",cursor:"pointer",fontWeight:700,fontSize:12,fontFamily:"inherit"}}>{m.name}</button>;
+              })}
+            </div>
+            {selOthers.length>0 && <>
+              <div style={{display:"flex",gap:8,marginBottom:10}}>
+                {[["equal","Поровну"],["custom","Вручную"]].map(([v,l])=>(
+                  <button key={v} type="button" onClick={()=>setSplitMode(v)} style={{flex:1,padding:"8px 0",borderRadius:10,border:splitMode===v?"2px solid var(--accent)":"1.5px solid var(--border)",background:splitMode===v?"var(--accent-soft)":"var(--input)",color:splitMode===v?"var(--accent)":"var(--t2)",cursor:"pointer",fontWeight:700,fontSize:12,fontFamily:"inherit"}}>{l}</button>
+                ))}
+              </div>
+              {selOthers.map(id=>{const m=members.find(x=>x.id===id);
+                return(<div key={id} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"6px 0",fontSize:13}}>
+                  <span style={{color:"var(--t2)",fontWeight:600}}>{m?.name} должен(на)</span>
+                  {splitMode==="equal"
+                    ? <span style={{fontWeight:700,color:"var(--t1)"}}>{fmt(perHead)} {cur.symbol}</span>
+                    : <NumberInput value={customShares[id]??""} onChange={e=>setCustomShares(s=>({...s,[id]:e.target.value}))} placeholder={fmt(perHead)} style={{...IS,width:110,padding:"6px 10px"}}/>}
+                </div>);
+              })}
+              <div style={{fontSize:11,color:"var(--t3)",marginTop:6}}>Остальное ({cur.symbol}) остаётся на {members.find(m=>m.id===memberId)?.name||"плательщике"} — он(а) уже заплатил(а).</div>
+            </>}
+          </div>}
+        </C$>
+      )}
+
+      <button disabled={!ok} onClick={()=>{onSave({...(expense||{}),memberId,categoryId,desc,amount:amt,currency:type==="income"?"RUB":currency,walletCurrency:type==="income"?"RUB":walletCurrency,conversionRate:needsRate?Number(conversionRate):null,date,type,note,split:type==="expense"?buildSplit():null});onClose();}} className="btn-primary" style={{opacity:ok?1:.5}}>{ed?"Сохранить":"Добавить"}</button>
+      {ed&&<button onClick={()=>{onDelete(expense.id);onClose();}} className="btn-primary" style={{background:"var(--danger-soft)",color:"var(--danger)"}}>Удалить запись</button>}
+    </div>
+  );
+}
+
+/* ═══ Форма покупки валюты ═══ */
+function PurchaseForm({purchase,lastChoice,onSave,onDelete,onClose}){
+  const ed=!!purchase;
+  const[date,setDate]=useState(purchase?.date||todayStr());
+  const[currency,setCurrency]=useState(purchase?.currency||lastChoice?.currency||"VND");
+  const[midCurrency,setMidCurrency]=useState(purchase?.midCurrency||lastChoice?.midCurrency||"USD");
+  const[amount,setAmount]=useState(purchase?.amount?.toString()||"");
+  const[rateDirect,setRateDirect]=useState(purchase?.rateDirect?.toString()||"");
+  const[rateMidRub,setRateMidRub]=useState(purchase?.rateMidRub?.toString()||"");
+  const[rateCurPerMid,setRateCurPerMid]=useState(purchase?.rateCurPerMid?.toString()||"");
+  const[note,setNote]=useState(purchase?.note||"");
+
+  // промежуточная валюта не может совпадать с покупаемой
+  useEffect(()=>{ if(midCurrency===currency){ setMidCurrency(currency==="RUB"?"USD":"RUB"); } },[currency]);
+
+  const isDirect = midCurrency==="RUB";
+  const cur = curInfo(currency);
+  const midCur = curInfo(midCurrency);
+  const amt=Number(amount)||0, rDir=Number(rateDirect)||0, rMid=Number(rateMidRub)||0, rCpm=Number(rateCurPerMid)||0;
+  const rubCost = isDirect ? amt*rDir : (rCpm>0 ? (amt/rCpm)*rMid : 0);
+  const ok = amount && date && (isDirect ? rateDirect : (rateMidRub && rateCurPerMid));
+
+  const save = () => {
+    onSave({
+      id: purchase?.id||uid(), date, currency, amount: amt,
+      midCurrency,
+      rateDirect: isDirect ? rDir : null,
+      rateMidRub: isDirect ? null : rMid,
+      rateCurPerMid: isDirect ? null : rCpm,
+      note, createdAt: purchase?.createdAt||Date.now()
+    });
+    onClose();
+  };
+
+  return(
+    <div style={{display:"flex",flexDirection:"column",gap:16}}>
+      <div><label style={LS}>Дата покупки</label><CalendarPicker value={date} onChange={setDate}/></div>
+      <div><label style={LS}>Валюта покупки</label><CurrencyChips value={currency} onChange={setCurrency} exclude={["RUB"]}/></div>
+      <div><label style={LS}>Сумма покупки ({cur.symbol})</label><NumberInput value={amount} onChange={e=>setAmount(e.target.value)} placeholder="напр. 3 000 000" style={IS} inputMode="decimal"/></div>
+      <div>
+        <label style={LS}>Через какую валюту конвертируете</label>
+        <CurrencyChips value={midCurrency} onChange={setMidCurrency} exclude={[currency]}/>
+        <div style={{fontSize:11,color:"var(--t3)",marginTop:4}}>«Рубль» — если купили {cur.name.toLowerCase()} напрямую за рубли. «Доллар»/«Юань» — если сначала купили их, а потом обменяли на {cur.name.toLowerCase()}.</div>
+      </div>
+      {isDirect
+        ? <div><label style={LS}>Курс покупки, ₽ за 1 {currency}</label><NumberInput value={rateDirect} onChange={e=>setRateDirect(e.target.value)} placeholder={currency==="VND"?"напр. 0.0032":"напр. 85.5"} style={IS}/></div>
+        : <>
+            <div><label style={LS}>Курс покупки {midCurrency==="USD"?"доллара":"юаня"}, ₽ за 1 {midCurrency}</label><NumberInput value={rateMidRub} onChange={e=>setRateMidRub(e.target.value)} placeholder="напр. 85.5" style={IS}/></div>
+            <div><label style={LS}>Курс обмена, {currency}/{midCurrency}</label><NumberInput value={rateCurPerMid} onChange={e=>setRateCurPerMid(e.target.value)} placeholder="напр. 26100" style={IS}/></div>
+          </>}
+      <div><label style={LS}>Комментарий</label><input value={note} onChange={e=>setNote(e.target.value)} placeholder="необязательно" style={IS}/></div>
+      {ok && <div style={{fontSize:13,color:"var(--t2)",background:"var(--accent-soft)",borderRadius:12,padding:"10px 14px"}}>≈ потрачено <b>{fmt(rubCost)} ₽</b> на эту покупку</div>}
+      <button disabled={!ok} onClick={save} className="btn-primary" style={{opacity:ok?1:.5}}>{ed?"Сохранить":"Добавить покупку"}</button>
+      {ed&&<button onClick={()=>{onDelete(purchase.id);onClose();}} className="btn-primary" style={{background:"var(--danger-soft)",color:"var(--danger)"}}>Удалить запись</button>}
+    </div>
+  );
+}
+
+/* ═══ Вкладка «Валюта» ═══ */
+function CurrencyTab({data,setData}){
+  const[addOpen,setAddOpen]=useState(false);
+  const[editPurchase,setEditPurchase]=useState(null);
+  const purchases = data.purchases||[];
+  const walletCurrencies = [...new Set(purchases.map(p=>p.currency))];
+  const sorted = [...purchases].sort((a,b)=>b.date.localeCompare(a.date)||(b.createdAt||0)-(a.createdAt||0));
+
+  const savePurchase = p => setData(pr=>{
+    const list = pr.purchases||[];
+    const exists = list.some(x=>x.id===p.id);
+    return {
+      ...pr,
+      purchases: exists ? list.map(x=>x.id===p.id?p:x) : [...list,p],
+      settings: {...pr.settings, lastPurchaseCurrency:p.currency, lastPurchaseMidCurrency:p.midCurrency}
+    };
+  });
+  const deletePurchase = id => setData(pr=>({...pr,purchases:(pr.purchases||[]).filter(x=>x.id!==id)}));
+  const lastChoice = { currency: data.settings?.lastPurchaseCurrency, midCurrency: data.settings?.lastPurchaseMidCurrency };
+
+  // живой курс каждого кошелька к донгу (для отображения остатка в VND по текущему курсу)
+  const[liveVnd,setLiveVnd]=useState({});
+  useEffect(()=>{
+    walletCurrencies.forEach(cc=>{
+      if(cc==="VND" || liveVnd[cc]!==undefined) return;
+      fetch(`https://open.er-api.com/v6/latest/${cc}`).then(r=>r.json()).then(d=>{
+        if(d.rates && d.rates.VND) setLiveVnd(pr=>({...pr,[cc]:d.rates.VND}));
+      }).catch(()=>setLiveVnd(pr=>({...pr,[cc]:null})));
+    });
+  },[walletCurrencies.join(",")]);
+
+  const rateLabel = p => {
+    if(!p.midCurrency || p.midCurrency==="RUB") return `${fmt(p.rateDirect,p.rateDirect<1?4:2)} ₽/${p.currency}`;
+    return `${fmt(p.rateMidRub,2)} ₽/${p.midCurrency}, ${fmt(p.rateCurPerMid)} ${p.currency}/${p.midCurrency}`;
+  };
+
+  return(
+    <div className="stack">
+      <C$ style={{textAlign:"center",padding:"18px 20px"}}>
+        <div style={{fontSize:13,color:"var(--t3)",marginBottom:4}}>Партии купленной валюты расходуются по очереди (FIFO). Если платите в другой валюте, чем купили (например, кошелёк $, а платёж в донгах картой), сумма конвертируется по курсу на момент оплаты и списывается с того же кошелька.</div>
+      </C$>
+
+      {walletCurrencies.length>0 && <div className="grid2">
+        {walletCurrencies.map(cc=>{
+          const b = currencyBalance(cc, purchases, data.expenses);
+          const cur = curInfo(cc);
+          const restRub = walletRestRubValue(cc, purchases, b.spent);
+          const vndRate = cc==="VND" ? 1 : liveVnd[cc];
+          const restVnd = cc==="VND" ? b.rest : (vndRate ? b.rest*vndRate : null);
+          return(<C$ key={cc} className="stat-card">
+            <div className="stat-label">Остаток {cur.name} ({cur.symbol})</div>
+            <div className="stat-value" style={{color:b.rest<0?"var(--danger)":"var(--t1)"}}>{fmt(b.rest)}</div>
+            <div style={{fontSize:11,color:"var(--t3)",marginTop:4}}>куплено {fmt(b.bought)} · потрачено {fmt(b.spent)}</div>
+            <div style={{marginTop:8,paddingTop:8,borderTop:"1px solid var(--border)",fontSize:12,color:"var(--t2)",display:"flex",flexDirection:"column",gap:2}}>
+              <span>≈ <b style={{color:"var(--t1)"}}>{fmt(restRub)} ₽</b> <span style={{color:"var(--t3)"}}>по курсу покупки</span></span>
+              {cc!=="VND" && <span>≈ <b style={{color:"var(--t1)"}}>{restVnd!=null?fmt(restVnd):"…"} ₫</b> <span style={{color:"var(--t3)"}}>по текущему курсу</span></span>}
+            </div>
+          </C$>);
+        })}
+      </div>}
+
+      <C$>
+        <div style={{fontSize:14,fontWeight:700,color:"var(--t1)",marginBottom:12}}>История покупок</div>
+        {!sorted.length && <div style={{textAlign:"center",padding:24,color:"var(--t3)",fontSize:13}}>Пока нет ни одной покупки валюты</div>}
+        {sorted.map(p=>{const cur=curInfo(p.currency);
+          return(<div key={p.id} onClick={()=>setEditPurchase(p)} style={{display:"flex",alignItems:"center",gap:12,padding:"10px 0",borderBottom:"1px solid var(--border)",cursor:"pointer"}}>
+            <div style={{width:40,height:40,borderRadius:12,background:"var(--accent-soft)",display:"grid",placeItems:"center",fontSize:16,fontWeight:800,color:"var(--accent)",flexShrink:0}}>{cur.symbol}</div>
+            <div style={{flex:1,minWidth:0}}>
+              <div style={{fontSize:13,fontWeight:700,color:"var(--t1)"}}>{fmt(p.amount)} {cur.symbol}</div>
+              <div style={{fontSize:11,color:"var(--t3)"}}>{new Date(p.date).toLocaleDateString("ru-RU")} · курс {rateLabel(p)}{p.note?` · ${p.note}`:""}</div>
+            </div>
+            <button onClick={e=>{e.stopPropagation();deletePurchase(p.id);}} style={{background:"none",border:"none",color:"var(--danger)",cursor:"pointer",fontSize:15,padding:6}}>✕</button>
+          </div>);
+        })}
+      </C$>
+
+      <button className="btn-primary" onClick={()=>setAddOpen(true)}>+ Добавить покупку валюты</button>
+      <Modal open={addOpen} onClose={()=>setAddOpen(false)} title="Покупка валюты">
+        <PurchaseForm lastChoice={lastChoice} onClose={()=>setAddOpen(false)} onSave={savePurchase}/>
+      </Modal>
+      <Modal open={!!editPurchase} onClose={()=>setEditPurchase(null)} title="Редактировать покупку">
+        {editPurchase && <PurchaseForm purchase={editPurchase} onClose={()=>setEditPurchase(null)} onSave={savePurchase} onDelete={deletePurchase}/>}
+      </Modal>
+    </div>
+  );
+}
+
+/* ═══ Вкладка «Долги» ═══ */
+function DebtsTab({data,setData,rubMap,dark}){
+  const members = data.members;
+  const gm = id => members.find(m=>m.id===id);
+  const[lineFilter,setLineFilter]=useState("unsettled"); // unsettled | settled | all
+
+  // построение чистых балансов между парами (только непогашенные — это и есть актуальный долг)
+  const net = {}; // net[a][b] = сколько a должен b (после взаимозачёта)
+  const lines = []; // ВСЕ построчные доли — и погашенные, и нет
+  data.expenses.forEach(e=>{
+    if(!e.split) return;
+    const total = rubMap[e.id]?.rub || 0;
+    Object.entries(e.split.shares||{}).forEach(([owerId, shareCur])=>{
+      const shareRub = e.amount>0 ? (shareCur/e.amount)*total : 0;
+      if(shareRub<=0) return;
+      const settled = !!e.split.settled?.[owerId];
+      lines.push({expenseId:e.id, owerId, payerId:e.memberId, amountRub:shareRub, desc:e.desc, catId:e.categoryId, date:e.date, settled});
+      if(!settled){ net[owerId]=net[owerId]||{}; net[owerId][e.memberId]=(net[owerId][e.memberId]||0)+shareRub; }
+    });
+  });
+  const pairs=[]; const seen=new Set();
+  Object.keys(net).forEach(a=>Object.keys(net[a]).forEach(b=>{
+    const key=[a,b].sort().join("|"); if(seen.has(key))return; seen.add(key);
+    const aOwesB=net[a]?.[b]||0, bOwesA=net[b]?.[a]||0, d=aOwesB-bOwesA;
+    if(Math.abs(d)<1)return;
+    pairs.push(d>0?{ower:a,payer:b,amount:d}:{ower:b,payer:a,amount:-d});
+  }));
+
+  const settleAll=(owerId,payerId)=>{
+    setData(pr=>({...pr,expenses:pr.expenses.map(e=>{
+      if(!e.split||e.memberId!==payerId||!(owerId in (e.split.shares||{})))return e;
+      return {...e,split:{...e.split,settled:{...e.split.settled,[owerId]:true}}};
+    })}));
+  };
+  const toggleLine=(expenseId,owerId)=>{
+    setData(pr=>({...pr,expenses:pr.expenses.map(e=>{
+      if(e.id!==expenseId||!e.split)return e;
+      return {...e,split:{...e.split,settled:{...e.split.settled,[owerId]:!e.split.settled?.[owerId]}}};
+    })}));
+  };
+
+  const visibleLines = lines.filter(l=>lineFilter==="all"?true:lineFilter==="settled"?l.settled:!l.settled);
+
+  return(
+    <div className="stack">
+      <C$>
+        <div style={{fontSize:14,fontWeight:700,color:"var(--t1)",marginBottom:14}}>Итоговый баланс</div>
+        {!pairs.length && <div style={{textAlign:"center",padding:24,color:"var(--t3)",fontSize:13}}>Все в расчёте — непогашенных долгов нет 🎉</div>}
+        {pairs.map((p,i)=>{const ower=gm(p.ower),payer=gm(p.payer);if(!ower||!payer)return null;
+          return(<div key={i} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 0",borderBottom:i<pairs.length-1?"1px solid var(--border)":"none"}}>
+            <div style={{flex:1,fontSize:13,color:"var(--t1)"}}><b>{ower.name}</b> должен(на) <b>{payer.name}</b></div>
+            <div style={{fontSize:15,fontWeight:800,color:"var(--t1)"}}>{fmt(p.amount)} ₽</div>
+            <button onClick={()=>settleAll(p.ower,p.payer)} style={{padding:"7px 12px",borderRadius:10,border:"none",background:"var(--accent-soft)",color:"var(--accent)",fontWeight:700,fontSize:12,cursor:"pointer",fontFamily:"inherit"}}>Вернул(а)</button>
+          </div>);
+        })}
+      </C$>
+
+      <C$>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12,flexWrap:"wrap",gap:8}}>
+          <div style={{fontSize:14,fontWeight:700,color:"var(--t1)"}}>По операциям</div>
+          <div style={{display:"flex",gap:6}}>
+            {[["unsettled","Активные"],["settled","Погашенные"],["all","Все"]].map(([v,l])=>(
+              <button key={v} onClick={()=>setLineFilter(v)} style={{padding:"6px 11px",borderRadius:8,border:lineFilter===v?"1.5px solid var(--accent)":"1px solid var(--border)",background:lineFilter===v?"var(--accent-soft)":"var(--input)",color:lineFilter===v?"var(--accent)":"var(--t2)",cursor:"pointer",fontWeight:600,fontSize:11.5,fontFamily:"inherit"}}>{l}</button>
+            ))}
+          </div>
+        </div>
+        {!visibleLines.length && <div style={{textAlign:"center",padding:16,color:"var(--t3)",fontSize:13}}>{lineFilter==="settled"?"Погашенных долгов пока нет":"Нет разделённых расходов"}</div>}
+        {visibleLines.sort((a,b)=>b.date.localeCompare(a.date)).map((l,i)=>{const ower=gm(l.owerId),payer=gm(l.payerId);const cat=CATS.find(c=>c.id===l.catId);
+          return(<div key={i} style={{display:"flex",alignItems:"center",gap:10,padding:"8px 0",borderBottom:"1px solid var(--border)",opacity:l.settled?.6:1}}>
+            <span style={{fontSize:18,flexShrink:0}}>{cat?.icon||"📦"}</span>
+            <div style={{flex:1,minWidth:0}}>
+              <div style={{fontSize:12.5,color:"var(--t1)",fontWeight:600,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",textDecoration:l.settled?"line-through":"none"}}>{l.desc||cat?.name}</div>
+              <div style={{fontSize:11,color:"var(--t3)"}}>{ower?.name} → {payer?.name} · {new Date(l.date).toLocaleDateString("ru-RU")}</div>
+            </div>
+            <span style={{fontSize:13,fontWeight:700,color:"var(--t1)"}}>{fmt(l.amountRub)} ₽</span>
+            <label style={{display:"flex",alignItems:"center",gap:4,fontSize:11,color:"var(--t3)",cursor:"pointer"}}>
+              <input type="checkbox" checked={l.settled} onChange={()=>toggleLine(l.expenseId,l.owerId)} style={{width:15,height:15}}/> вернул
+            </label>
+          </div>);
+        })}
+      </C$>
+    </div>
+  );
+}
+
+/* ═══ Settings ═══ */
+function Settings({data,setData,onClose,theme,setTheme,syncUrl,setSyncUrl,syncStatus,onSyncNow}){
+  const dark = useTheme();
+  const[budget,setBudget]=useState(data.budget?.toString()||"50000");
+  const[goal,setGoal]=useState(data.goal?.toString()||"10000");
+  const[warn,setWarn]=useState(data.warn?.toString()||"80");
+  const[nn,setNn]=useState("");
+  const[editMemberId,setEditMemberId]=useState(null);
+  const[editMemberName,setEditMemberName]=useState("");
+  const saveMemberName = () => {
+    const name = editMemberName.trim();
+    if(name) setData(pr=>({...pr,members:pr.members.map(m=>m.id===editMemberId?{...m,name}:m)}));
+    setEditMemberId(null);
+  };
+  const[urlDraft,setUrlDraft]=useState(syncUrl||"");
+  const statusText = syncStatus?.state==="syncing" ? "Синхронизация…"
+    : syncStatus?.state==="ok" ? `Синхронизировано · ${new Date(syncStatus.time).toLocaleTimeString("ru-RU",{hour:"2-digit",minute:"2-digit"})}`
+    : syncStatus?.state==="error" ? `Ошибка: ${syncStatus.error}`
+    : "Синхронизация не подключена";
+  const statusColor = syncStatus?.state==="error" ? "var(--danger)" : syncStatus?.state==="ok" ? "var(--accent)" : "var(--t3)";
+  return(
+    <div style={{display:"flex",flexDirection:"column",gap:16}}>
+      <C$>
+        <label style={LS}>Синхронизация между устройствами</label>
+        <div style={{fontSize:11,color:"var(--t3)",marginBottom:10,lineHeight:1.5}}>Вставьте ссылку на Google Apps Script, чтобы данные были общими на телефоне, компьютере и у других участников. Как получить ссылку — см. инструкцию под приложением.</div>
+        <div style={{display:"flex",gap:8}}>
+          <input value={urlDraft} onChange={e=>setUrlDraft(e.target.value)} placeholder="https://script.google.com/macros/s/.../exec" style={{...IS,flex:1}}/>
+          <button onClick={()=>setSyncUrl(urlDraft.trim())} className="btn-icon" style={{width:"auto",padding:"0 14px",fontWeight:700,fontSize:12}}>Сохранить</button>
+        </div>
+        {syncUrl && <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:10}}>
+          <span style={{fontSize:12,color:statusColor,fontWeight:600}}>{statusText}</span>
+          <div style={{display:"flex",gap:8}}>
+            <button onClick={onSyncNow} className="btn-icon" style={{width:"auto",padding:"0 12px",fontSize:12,fontWeight:700}}>⟳ Обновить</button>
+            <button onClick={()=>{setSyncUrl("");setUrlDraft("");}} className="btn-icon" style={{width:"auto",padding:"0 12px",fontSize:12,fontWeight:700,color:"var(--danger)"}}>Отключить</button>
+          </div>
+        </div>}
+      </C$>
+      <C$>
+        <label style={LS}>Тема оформления</label>
+        <div style={{display:"flex",gap:8}}>
+          {[["light","☀️","Светлая"],["dark","🌙","Тёмная"]].map(([v,ico,lb])=>(
+            <button key={v} onClick={()=>setTheme(v)} style={{flex:1,padding:"14px 0",borderRadius:14,border:theme===v?`2px solid var(--accent)`:"1.5px solid var(--border)",background:theme===v?"var(--accent-soft)":"var(--input)",color:theme===v?"var(--accent)":"var(--t2)",cursor:"pointer",fontWeight:700,fontSize:14,fontFamily:"inherit",display:"flex",alignItems:"center",justifyContent:"center",gap:8,transition:"all .2s"}}>
+              <span style={{fontSize:18}}>{ico}</span>{lb}
+            </button>
+          ))}
+        </div>
+      </C$>
+      <C$>
+        <label style={LS}>Валюта по умолчанию для новых расходов</label>
+        <CurrencyChips value={data.settings?.defaultCurrency||"RUB"} onChange={cc=>setData(pr=>({...pr,settings:{...pr.settings,defaultCurrency:cc}}))}/>
+      </C$>
+      <C$>
+        <label style={LS}>Месячный бюджет (₽)</label>
+        <NumberInput value={budget} onChange={e=>setBudget(e.target.value)} style={IS}/>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginTop:14}}>
+          <div><label style={LS}>Цель накоплений</label><NumberInput value={goal} onChange={e=>setGoal(e.target.value)} style={IS}/></div>
+          <div><label style={LS}>Порог предупр. (%)</label><NumberInput value={warn} onChange={e=>setWarn(e.target.value)} style={IS}/></div>
+        </div>
+      </C$>
+      <C$>
+        <label style={LS}>Конверты по категориям (₽ на месяц)</label>
+        <div style={{fontSize:11,color:"var(--t3)",marginBottom:10}}>Необязательно: задайте лимит по каждой статье, чтобы видеть заполнение на дашборде — как в методе конвертов.</div>
+        {CATS.map(c=>(
+          <div key={c.id} style={{display:"flex",alignItems:"center",gap:10,marginBottom:8}}>
+            <span style={{fontSize:18,width:26}}>{c.icon}</span>
+            <span style={{flex:1,fontSize:13,fontWeight:600,color:"var(--t1)"}}>{c.name}</span>
+            <NumberInput placeholder="—" value={data.categoryBudgets?.[c.id]??""} onChange={e=>{const v=e.target.value;setData(pr=>({...pr,categoryBudgets:{...pr.categoryBudgets,[c.id]:v===""?undefined:Number(v)}}));}} style={{...IS,width:110,padding:"7px 10px"}}/>
+          </div>
+        ))}
+      </C$>
+      <C$>
+        <label style={LS}>Участники</label>
+        {data.members.map(m=>{const p=gpal(m,dark);const isEd=editMemberId===m.id;
+          return(
+            <div key={m.id} style={{display:"flex",alignItems:"center",gap:12,marginBottom:10,padding:"8px 0",borderBottom:"1px solid var(--border)"}}>
+              <div style={{width:38,height:38,borderRadius:12,background:p.bg,color:p.text,display:"grid",placeItems:"center",fontWeight:700,fontSize:13,flexShrink:0}}>{m.name.slice(0,2).toUpperCase()}</div>
+              {isEd
+                ? <input autoFocus value={editMemberName} onChange={e=>setEditMemberName(e.target.value)}
+                    onKeyDown={e=>{if(e.key==="Enter")saveMemberName();if(e.key==="Escape")setEditMemberId(null);}}
+                    style={{...IS,flex:1,width:"auto",padding:"7px 10px"}}/>
+                : <span style={{flex:1,fontWeight:600,fontSize:14,color:"var(--t1)"}}>{m.name}</span>}
+              {isEd
+                ? <button onClick={saveMemberName} className="btn-icon" style={{fontSize:13,color:"var(--accent)"}}>✓</button>
+                : <button onClick={()=>{setEditMemberId(m.id);setEditMemberName(m.name);}} className="btn-icon" style={{fontSize:13}}>✎</button>}
+              <button onClick={()=>{if(confirm(`Удалить ${m.name}?`))setData(pr=>({...pr,members:pr.members.filter(x=>x.id!==m.id),expenses:pr.expenses.filter(e=>e.memberId!==m.id)}));}} className="btn-icon" style={{fontSize:14}}>🗑</button>
+            </div>);
+        })}
+        {data.members.length<6&&(
+          <div style={{display:"flex",gap:8,marginTop:8}}>
+            <input value={nn} onChange={e=>setNn(e.target.value)} placeholder="Имя" style={{...IS,flex:1,width:"auto"}}/>
+            <button onClick={()=>{if(nn.trim()){setData(pr=>({...pr,members:[...pr.members,{id:uid(),name:nn.trim(),ci:pr.members.length%6}]}));setNn("");}}} className="btn-primary" style={{width:"auto",padding:"12px 24px"}}>+</button>
+          </div>
+        )}
+      </C$>
+      <button onClick={()=>{setData(pr=>({...pr,budget:Number(budget)||50000,goal:Number(goal)||10000,warn:Number(warn)||80}));onClose();}} className="btn-primary">Сохранить</button>
+      <button onClick={()=>{if(confirm("Сбросить ВСЕ данные?"))setData({members:[],expenses:[],purchases:[],budget:50000,goal:10000,warn:80,categoryBudgets:{},settings:{defaultCurrency:"RUB",displayCurrency:"RUB"}});}} className="btn-primary" style={{background:"var(--danger-soft)",color:"var(--danger)"}}>Сбросить всё</button>
+    </div>
+  );
+}
+
+function EnvelopesCard({categoryBudgets, catBD, conv, dSym}){
+  const spentMap = {}; catBD.forEach(c=>{spentMap[c.id]=c.value;});
+  const rows = CATS.filter(c=>categoryBudgets?.[c.id]>0).map(c=>{
+    const budget = categoryBudgets[c.id];
+    const spent = spentMap[c.id]||0;
+    const p = pct(spent,budget);
+    const over = p>=100;
+    return {...c, budget, spent, p, over};
+  });
+  if(!rows.length) return null;
+  return(
+    <C$>
+      <div style={{fontSize:14,fontWeight:700,color:"var(--t1)",marginBottom:4}}>Конверты</div>
+      <div style={{fontSize:11,color:"var(--t3)",marginBottom:14}}>Лимит по категориям — задайте в Настройках</div>
+      {rows.map(c=>(
+        <div key={c.id} style={{marginBottom:14}}>
+          <div style={{display:"flex",justifyContent:"space-between",marginBottom:5}}>
+            <span style={{fontSize:13,fontWeight:600,color:"var(--t1)"}}>{c.icon} {c.name}</span>
+            <span style={{fontSize:12,fontWeight:700,color:c.over?"var(--danger)":"var(--t2)"}}>{fmt(conv(c.spent))} / {fmt(conv(c.budget))} {dSym}</span>
+          </div>
+          <div style={{height:8,borderRadius:4,background:"var(--bg3)",overflow:"hidden"}}>
+            <div style={{height:"100%",borderRadius:4,width:`${Math.min(c.p,100)}%`,background:c.over?"var(--danger)":c.p>=80?"#e07845":c.color,transition:"width .6s"}}/>
+          </div>
+        </div>
+      ))}
+    </C$>
+  );
+}
+
+/* ═══ Синхронизация через Google Таблицу (Apps Script как бесплатный JSON-бэкенд) ═══ */
+async function syncPull(url) {
+  const res = await fetch(url, {cache:"no-store"});
+  if (!res.ok) throw new Error("pull failed: "+res.status);
+  return res.json();
+}
+async function syncPush(url, data) {
+  // text/plain — чтобы избежать CORS-preflight (Apps Script не обрабатывает OPTIONS по умолчанию)
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {"Content-Type":"text/plain;charset=utf-8"},
+    body: JSON.stringify(data)
+  });
+  if (!res.ok) throw new Error("push failed: "+res.status);
+  return res.json();
+}
+
+/* ═══ MAIN ═══ */
+function App(){
+  const[data,setData]=useState(null);
+  const[theme,setTheme]=useState("light");
+  const[tab,setTab]=useState("dashboard");
+  const[addOpen,setAddOpen]=useState(false);
+  const[editExp,setEditExp]=useState(null);
+  const[stOpen,setStOpen]=useState(false);
+  const[fM,setFM]=useState("all");
+  const[fMo,setFMo]=useState(()=>{const n=new Date();return`${n.getFullYear()}-${String(n.getMonth()+1).padStart(2,"0")}`;});
+  const[anPeriod,setAnPeriod]=useState("month");
+  const[anCustomFrom,setAnCustomFrom]=useState(()=>{const d=new Date();d.setDate(d.getDate()-30);return d.toISOString().slice(0,10);});
+  const[anCustomTo,setAnCustomTo]=useState(todayStr());
+  const[anFormat,setAnFormat]=useState("day");
+  const[syncUrl,setSyncUrlState]=useState(()=>{try{return localStorage.getItem("fam-budget-sync-url")||"";}catch{return"";}});
+  const[syncStatus,setSyncStatus]=useState({state:"idle",time:null,error:null}); // idle|syncing|ok|error
+  const setSyncUrl = url => { setSyncUrlState(url); try{ url ? localStorage.setItem("fam-budget-sync-url",url) : localStorage.removeItem("fam-budget-sync-url"); }catch{} };
+  const lastEditRef = useRef(0);
+  const pushTimerRef = useRef(null);
+  const ok=useRef(false);
+  const dark = theme === "dark";
+
+  useEffect(()=>{
+    try {
+      const raw = localStorage.getItem("fam-budget-local");
+      if (raw) {
+        const d = JSON.parse(raw);
+        if (d.expenses && !Array.isArray(d.expenses)) d.expenses = Object.values(d.expenses);
+        if (!d.expenses) d.expenses = [];
+        if (d.members && !Array.isArray(d.members)) d.members = Object.values(d.members);
+        if (!d.members) d.members = [];
+        if (!Array.isArray(d.purchases)) d.purchases = [];
+        d.purchases = d.purchases.map(p=>{
+          if (p.midCurrency !== undefined) return p; // уже новая схема
+          if (p.rateUsdRub !== undefined) { // миграция со старой схемы (промежуточная валюта всегда была USD)
+            if (p.currency === "USD") return { ...p, midCurrency:"RUB", rateDirect: p.rateUsdRub||0, rateMidRub:null, rateCurPerMid:null };
+            return { ...p, midCurrency:"USD", rateMidRub:p.rateUsdRub, rateCurPerMid:p.rateCurPerUsd, rateDirect:null };
+          }
+          return p;
+        });
+        if (!d.budget) d.budget = 50000;
+        if (!d.settings) d.settings = { defaultCurrency:"RUB", displayCurrency:"RUB" };
+        if (!d.categoryBudgets) d.categoryBudgets = {};
+        d.expenses.forEach(e=>{ if(!e.currency) e.currency="RUB"; });
+        setData(d);
+        if (d.theme) setTheme(d.theme);
+      } else {
+        setData({members:[],expenses:[],purchases:[],budget:50000,goal:10000,warn:80,categoryBudgets:{},settings:{defaultCurrency:"RUB",displayCurrency:"RUB"}});
+      }
+    } catch {
+      setData({members:[],expenses:[],purchases:[],budget:50000,goal:10000,warn:80,categoryBudgets:{},settings:{defaultCurrency:"RUB",displayCurrency:"RUB"}});
+    }
+    ok.current = true;
+  },[]);
+
+  useEffect(()=>{
+    if (!ok.current || !data) return;
+    try { localStorage.setItem("fam-budget-local", JSON.stringify({...data, theme})); } catch {}
+    lastEditRef.current = Date.now();
+    if (!syncUrl) return;
+    clearTimeout(pushTimerRef.current);
+    pushTimerRef.current = setTimeout(async ()=>{
+      setSyncStatus(s=>({...s,state:"syncing"}));
+      try { await syncPush(syncUrl, data); setSyncStatus({state:"ok",time:Date.now(),error:null}); }
+      catch(err){ setSyncStatus({state:"error",time:null,error:String(err.message||err)}); }
+    }, 1200);
+  },[data, theme]);
+
+  // первичная синхронизация — выполняется РОВНО один раз, и только когда data гарантированно уже загружена из localStorage
+  const didInitialSync = useRef(false);
+  useEffect(()=>{
+    if (!syncUrl || !data || didInitialSync.current) return;
+    didInitialSync.current = true;
+    (async ()=>{
+      setSyncStatus(s=>({...s,state:"syncing"}));
+      try {
+        const remote = await syncPull(syncUrl);
+        if (remote && Array.isArray(remote.members)) {
+          const remoteEmpty = remote.members.length===0 && (!remote.expenses||!remote.expenses.length);
+          const localHasData = data.members.length>0 || data.expenses.length>0;
+          if (remoteEmpty && localHasData) await syncPush(syncUrl, data); // таблица пустая — инициализируем текущими данными
+          else setData(remote);
+        }
+        setSyncStatus({state:"ok",time:Date.now(),error:null});
+      } catch(err){ setSyncStatus({state:"error",time:null,error:String(err.message||err)}); }
+    })();
+  },[syncUrl, data]);
+
+  // подтягиваем актуальные данные при возврате в приложение (фокус вкладки/окна)
+  useEffect(()=>{
+    if (!syncUrl) return;
+    const pull = async () => {
+      if (Date.now()-lastEditRef.current < 3000) return; // не перетираем только что введённое
+      setSyncStatus(s=>({...s,state:"syncing"}));
+      try {
+        const remote = await syncPull(syncUrl);
+        if (remote && Array.isArray(remote.members)) setData(remote);
+        setSyncStatus({state:"ok",time:Date.now(),error:null});
+      } catch(err){ setSyncStatus({state:"error",time:null,error:String(err.message||err)}); }
+    };
+    window.addEventListener("focus", pull);
+    window.addEventListener("visibilitychange", pull);
+    return ()=>{ window.removeEventListener("focus", pull); window.removeEventListener("visibilitychange", pull); };
+  },[syncUrl]);
+
+  const fifoIdx = useMemo(()=>data?buildFifoIndex(data.purchases||[]):{},[data?.purchases]);
+  const rubMap = useMemo(()=>data?buildRubMap(data.expenses,fifoIdx):{},[data?.expenses,fifoIdx]);
+  const getRub = e => rubMap[e.id]?.rub ?? e.amount ?? 0;
+  const walletsList = useMemo(()=>{
+    if(!data) return [];
+    const codes = [...new Set((data.purchases||[]).map(p=>p.currency))];
+    return codes.map(cc=>({code:cc, ...currencyBalance(cc, data.purchases||[], data.expenses)}));
+  },[data?.purchases,data?.expenses]);
+
+  const dispCur = data?.settings?.displayCurrency || "RUB";
+  const[liveRates,setLiveRates]=useState({}); // code -> RUB за 1 единицу (фолбэк, когда своего кошелька нет)
+  useEffect(()=>{
+    if(!data || dispCur==="RUB" || fifoIdx[dispCur]) return;
+    if(liveRates[dispCur]) return;
+    let cancelled=false;
+    fetch(`https://open.er-api.com/v6/latest/${dispCur}`).then(r=>r.json()).then(d=>{
+      if(!cancelled && d.rates && d.rates.RUB) setLiveRates(pr=>({...pr,[dispCur]:d.rates.RUB}));
+    }).catch(()=>{});
+    return ()=>{cancelled=true;};
+  },[dispCur,fifoIdx,data]);
+  const displayRate = useMemo(()=>{
+    if(!data || dispCur==="RUB") return 1;
+    const lots = fifoIdx[dispCur];
+    if(lots && lots.length) return lots[lots.length-1].rate;
+    if(liveRates[dispCur]) return liveRates[dispCur];
+    return null; // нет данных о курсе
+  },[data,dispCur,fifoIdx,liveRates]);
+  const conv = rub => displayRate ? rub/displayRate : rub;
+  const dSym = curInfo(dispCur).symbol;
+
+  const fil=useMemo(()=>data?data.expenses.filter(e=>e.date?.startsWith(fMo)&&(fM==="all"||e.memberId===fM)):[],[data,fMo,fM]);
+  const totE=useMemo(()=>fil.filter(e=>e.type==="expense").reduce((s,e)=>s+getRub(e),0),[fil,rubMap]);
+  const totI=useMemo(()=>fil.filter(e=>e.type==="income").reduce((s,e)=>s+getRub(e),0),[fil,rubMap]);
+  const catBD=useMemo(()=>{const m={};fil.filter(e=>e.type==="expense").forEach(e=>{if(!m[e.categoryId])m[e.categoryId]={value:0,count:0};m[e.categoryId].value+=getRub(e);m[e.categoryId].count+=1;});return CATS.filter(c=>m[c.id]).map(c=>({...c,value:m[c.id].value,count:m[c.id].count})).sort((a,b)=>b.value-a.value);},[fil,rubMap]);
+  const memBD=useMemo(()=>{if(!data)return[];const m={};fil.filter(e=>e.type==="expense").forEach(e=>{m[e.memberId]=(m[e.memberId]||0)+getRub(e);});return data.members.map(mem=>({...mem,value:m[mem.id]||0,color:PAL[mem.ci%6].accent})).filter(x=>x.value>0).sort((a,b)=>b.value-a.value);},[data,fil,rubMap]);
+  const dayData=useMemo(()=>{const[y,mo]=fMo.split("-").map(Number);const days=new Date(y,mo,0).getDate();const a=Array.from({length:days},(_,i)=>({label:`${i+1}`,value:0}));fil.filter(e=>e.type==="expense").forEach(e=>{const d=parseInt(e.date.split("-")[2],10);if(d>=1&&d<=days)a[d-1].value+=getRub(e);});return a;},[fil,fMo,rubMap]);
+  const sorted=useMemo(()=>[...fil].sort((a,b)=>b.date.localeCompare(a.date)||(b.createdAt||0)-(a.createdAt||0)),[fil]);
+
+  const [anFrom,anTo] = useMemo(()=>periodRange(anPeriod,anCustomFrom,anCustomTo),[anPeriod,anCustomFrom,anCustomTo]);
+  const anFil = useMemo(()=>data?data.expenses.filter(e=>e.type==="expense"&&e.date>=anFrom&&e.date<=anTo&&(fM==="all"||e.memberId===fM)):[],[data,anFrom,anTo,fM]);
+  const anTotE = useMemo(()=>anFil.reduce((s,e)=>s+getRub(e),0),[anFil,rubMap]);
+  const anCatBD = useMemo(()=>{const m={};anFil.forEach(e=>{if(!m[e.categoryId])m[e.categoryId]={value:0,count:0};m[e.categoryId].value+=getRub(e);m[e.categoryId].count+=1;});return CATS.filter(c=>m[c.id]).map(c=>({...c,value:m[c.id].value,count:m[c.id].count})).sort((a,b)=>b.value-a.value);},[anFil,rubMap]);
+  const anMemBD = useMemo(()=>{if(!data)return[];const m={};anFil.forEach(e=>{m[e.memberId]=(m[e.memberId]||0)+getRub(e);});return data.members.map(mem=>({...mem,value:m[mem.id]||0,color:PAL[mem.ci%6].accent})).filter(x=>x.value>0).sort((a,b)=>b.value-a.value);},[data,anFil,rubMap]);
+  const anBuckets = useMemo(()=>buildBuckets(anFil,anFormat,getRub,anFrom,anTo),[anFil,anFormat,rubMap,anFrom,anTo]);
+  const anDays = useMemo(()=>{const ms=(new Date(anTo)-new Date(anFrom))/864e5+1;return Math.max(1,Math.round(ms));},[anFrom,anTo]);
+
+  if(!data) return <div className={dark?"dark":""} style={{display:"grid",placeItems:"center",height:"100vh",background:"var(--bg0)"}}><style>{CSS}</style><p style={{color:"var(--t3)"}}>Загрузка...</p></div>;
+
+  if(!data.members.length) return(
+    <ThemeCtx.Provider value={dark}>
+    <div className={dark?"dark":""} style={{minHeight:"100vh",background:"var(--bg0)",display:"grid",placeItems:"center",padding:20}}>
+      <style>{CSS}</style>
+      <Onboarding onDone={(names,budget)=>setData({members:names.map((n,i)=>({id:uid(),name:n,ci:i%6})),expenses:[],purchases:[],budget,goal:10000,warn:80,categoryBudgets:{},settings:{defaultCurrency:"RUB",displayCurrency:"RUB"}})}/>
+    </div>
+    </ThemeCtx.Provider>
+  );
+
+  const gm=id=>data.members.find(m=>m.id===id);
+  const gp=m=>gpal(m,dark);
+  const bP=pct(totE,data.budget);
+  const over=bP>=100;const warning=bP>=(data.warn||80);const rem=data.budget-totE;
+  const moLabel=new Date(fMo+"-01").toLocaleDateString("ru-RU",{month:"long",year:"numeric"});
+
+  const CurSwitcher = () => (
+    <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:14}}>
+      <span style={{fontSize:12,color:"var(--t3)",alignSelf:"center",marginRight:2}}>Показывать в:</span>
+      {[...new Set(["RUB","VND",...Object.keys(fifoIdx)])].map(cc=>{const s=cc===dispCur;const cur=curInfo(cc);
+        return <button key={cc} onClick={()=>setData(pr=>({...pr,settings:{...pr.settings,displayCurrency:cc}}))} style={{padding:"6px 12px",borderRadius:10,border:s?"2px solid var(--accent)":"1.5px solid var(--border)",background:s?"var(--accent-soft)":"var(--input)",color:s?"var(--accent)":"var(--t2)",cursor:"pointer",fontWeight:700,fontSize:12,fontFamily:"inherit"}}>{cur.symbol} {cc}</button>;
+      })}
+    </div>
+  );
+
+  const TAB_ITEMS = [["dashboard","📊","Дашборд"],["list","📋","Записи"],["currency","💱","Валюта"],["debts","🤝","Долги"],["analytics","📈","Анализ"]];
+
+  return(
+    <ThemeCtx.Provider value={dark}>
+    <div className={dark?"dark":""} style={{minHeight:"100vh",background:"var(--bg0)",color:"var(--t1)",transition:"background .3s, color .3s"}}>
+      <style>{CSS}</style>
+
+      <div className="app-shell">
+        <nav className="sidebar">
+          <div className="sidebar-brand">
+            <div style={{width:30,height:30,borderRadius:8,background:"var(--accent)",display:"grid",placeItems:"center",flexShrink:0}}>
+              <span style={{fontSize:15,filter:"brightness(10)"}}>💰</span>
+            </div>
+            <span style={{fontWeight:700,fontSize:14.5,color:"var(--t1)",letterSpacing:"-.01em"}}>Семейный бюджет</span>
+          </div>
+          <div className="sidebar-nav">
+            {TAB_ITEMS.map(([id,ico,lb])=>(
+              <button key={id} onClick={()=>setTab(id)} className={`sidebar-item${tab===id?" active":""}`}><span className="ico">{ico}</span>{lb}</button>
+            ))}
+          </div>
+          <button onClick={()=>setStOpen(true)} className="sidebar-item"><span className="ico">⚙</span>Настройки</button>
+        </nav>
+
+        <div className="main">
+      <header className="header">
+        <div style={{display:"flex",alignItems:"center",gap:10}}>
+          <div className="header-brand-mobile" style={{width:36,height:36,borderRadius:8,background:"var(--accent)",display:"grid",placeItems:"center"}}>
+            <span style={{fontSize:18,filter:"brightness(10)"}}>💰</span>
+          </div>
+          <div>
+            <div style={{fontWeight:700,fontSize:15,color:"var(--t1)",letterSpacing:"-.01em"}}>{TAB_ITEMS.find(t=>t[0]===tab)?.[2]||"Семейный бюджет"}</div>
+            <div style={{fontSize:11,color:"var(--t3)",fontWeight:500,textTransform:"capitalize"}}>{moLabel}</div>
+          </div>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          {data.members.map(m=>{const p=gp(m);const s=fM===m.id;
+            return <button key={m.id} title={m.name} onClick={()=>setFM(fM===m.id?"all":m.id)} style={{width:32,height:32,borderRadius:8,background:s?p.accent:p.bg,color:s?"#fff":p.text,display:"grid",placeItems:"center",fontSize:11,fontWeight:700,border:"none",cursor:"pointer",transition:"all .2s"}}>{m.name.slice(0,2).toUpperCase()}</button>;
+          })}
+          <button onClick={()=>setAddOpen(true)} className="btn-add">+ Добавить</button>
+          <button onClick={()=>setStOpen(true)} className="btn-icon mobile-tabs">⚙</button>
+        </div>
+      </header>
+
+      <div className="main-inner">
+      <div style={{padding:"14px 20px 6px",display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
+        <input type="month" value={fMo} onChange={e=>setFMo(e.target.value)} className="month-input"/>
+        {fM!=="all"&&(()=>{const m=gm(fM),p=gp(m);return <span className="filter-badge" style={{background:p.bg,color:p.text}}>{m.name}<button onClick={()=>setFM("all")} style={{background:"none",border:"none",cursor:"pointer",color:p.text,fontSize:13,padding:0,marginLeft:4}}>✕</button></span>;})()}
+      </div>
+      <div className="mobile-tabs" style={{padding:"0 20px 12px",overflowX:"auto"}}>
+        <div className="tab-bar">
+          {TAB_ITEMS.map(([id,ico,lb])=>(
+            <button key={id} onClick={()=>setTab(id)} className={`tab-btn${tab===id?" active":""}`}>{lb}</button>
+          ))}
+        </div>
+      </div>
+
+      <div style={{padding:"0 20px"}} className="content">
+
+        {tab==="dashboard"&&<div className="stack">
+          <CurSwitcher/>
+          {displayRate===null && <C$ style={{padding:"10px 16px",background:"var(--danger-soft)",color:"var(--danger)",fontSize:12}}>Нет курса для {dispCur} — добавьте покупку этой валюты на вкладке «Валюта», суммы показаны как есть.</C$>}
+          <div className="grid3">
+            <C$ className="stat-card"><div className="stat-label">Бюджет</div><div className="stat-value">{fmt(conv(data.budget))}<span className="stat-cur"> {dSym}</span></div><div style={{fontSize:11,color:"var(--t3)",marginTop:4}}>на месяц</div></C$>
+            <C$ className="stat-card accent-card"><div className="stat-label" style={{color:"rgba(255,255,255,.7)"}}>Потрачено</div><div className="stat-value" style={{color:"#fff"}}>{fmt(conv(totE))}<span className="stat-cur"> {dSym}</span></div><div className="accent-badge">{bP}% бюджета</div></C$>
+            <C$ className="stat-card"><div className="stat-label">Остаток</div><div className="stat-value" style={{color:rem>=0?"var(--accent)":"var(--danger)"}}>{fmt(conv(rem))}<span className="stat-cur"> {dSym}</span></div>{totI>0&&<div style={{display:"inline-flex",alignItems:"center",gap:3,fontSize:11,marginTop:4,padding:"3px 8px",borderRadius:8,background:"var(--accent-soft)",color:"var(--accent)",fontWeight:600}}>↑ +{fmt(conv(totI))} доход</div>}</C$>
+          </div>
+
+          <C$><div style={{display:"flex",justifyContent:"space-between",marginBottom:10}}><span style={{fontSize:13,fontWeight:600,color:"var(--t2)"}}>Использование бюджета</span><span style={{fontSize:14,fontWeight:800,color:over?"var(--danger)":warning?"#e07845":"var(--accent)"}}>{bP}%</span></div>
+            <div style={{height:8,borderRadius:4,background:"var(--bg3)",overflow:"hidden"}}><div style={{height:"100%",borderRadius:4,width:`${Math.min(bP,100)}%`,background:over?"var(--danger)":warning?"#e07845":"var(--accent)",transition:"width .7s ease"}}/></div>
+          </C$>
+
+          <EnvelopesCard categoryBudgets={data.categoryBudgets} catBD={catBD} conv={conv} dSym={dSym}/>
+
+          {catBD.length>0&&<CategoryOverviewCard catBD={catBD} conv={conv} dSym={dSym}/>}
+
+          {memBD.length>1&&<C$><div style={{fontSize:14,fontWeight:700,color:"var(--t1)",marginBottom:14}}>Кто сколько потратил</div>
+            {memBD.map(m=>{const p=gpal(m,dark);return(
+              <div key={m.id} style={{display:"flex",alignItems:"center",gap:12,marginBottom:12}}>
+                <div style={{width:36,height:36,borderRadius:12,background:p.bg,color:p.text,display:"grid",placeItems:"center",fontWeight:700,fontSize:12,flexShrink:0}}>{m.name.slice(0,2).toUpperCase()}</div>
+                <div style={{flex:1}}>
+                  <div style={{display:"flex",justifyContent:"space-between",marginBottom:3}}><span style={{fontSize:13,fontWeight:600,color:"var(--t1)"}}>{m.name}</span><span style={{fontSize:13,fontWeight:700,color:"var(--t1)"}}>{fmt(conv(m.value))} {dSym} <span style={{fontWeight:500,color:"var(--t3)"}}>({pct(m.value,totE)}%)</span></span></div>
+                  <div style={{height:4,borderRadius:2,background:"var(--bg3)"}}><div style={{height:"100%",borderRadius:2,width:`${pct(m.value,totE)}%`,background:m.color,transition:"width .6s"}}/></div>
+                </div>
+              </div>);})}
+          </C$>}
+
+          {dayData.some(d=>d.value>0)&&<C$><div style={{fontSize:14,fontWeight:700,color:"var(--t1)",marginBottom:12}}>По дням месяца</div>
+            <div style={{display:"flex",alignItems:"flex-end",gap:2,height:80}}>{dayData.map((d,i)=>{const mx=Math.max(...dayData.map(x=>x.value),1);return <div key={i} title={`${d.label}: ${fmt(conv(d.value))} ${dSym}`} style={{flex:1,height:`${Math.max(d.value/mx*100,3)}%`,background:d.value>0?"var(--accent)":"var(--bg3)",borderRadius:3,opacity:d.value>0?.8:.3,transition:"height .5s",minWidth:2,cursor:"default"}}/>;})}</div>
+          </C$>}
+
+          {!fil.length&&<C$ style={{textAlign:"center",padding:48}}><div style={{fontSize:48,marginBottom:12,opacity:.6}}>📝</div><div style={{color:"var(--t3)",fontSize:15,lineHeight:1.6}}>Нет записей за этот месяц<br/>Нажмите <b>+</b> чтобы добавить</div></C$>}
+        </div>}
+
+        {tab==="list"&&<div className="stack">
+          {!sorted.length&&<C$ style={{textAlign:"center",padding:48}}><div style={{fontSize:48,marginBottom:12,opacity:.6}}>📋</div><div style={{color:"var(--t3)",fontSize:15}}>Нет записей</div></C$>}
+          {(()=>{let last="";return sorted.map(e=>{
+            const cat=CATS.find(c=>c.id===e.categoryId)||CATS[CATS.length-1];const m=gm(e.memberId);const p=m?gp(m):PAL[0];
+            const sh=e.date!==last;last=e.date;
+            const dl=new Date(e.date).toLocaleDateString("ru-RU",{weekday:"short",day:"numeric",month:"short"});
+            const cur=curInfo(e.currency||"RUB");
+            const info=rubMap[e.id]||{};
+            return(<div key={e.id}>
+              {sh&&<div style={{fontSize:12,fontWeight:700,color:"var(--t3)",padding:"14px 2px 6px",textTransform:"capitalize"}}>{dl}</div>}
+              <C$ onClick={()=>setEditExp(e)} style={{padding:"14px 16px",cursor:"pointer",marginBottom:6}}>
+                <div style={{display:"flex",alignItems:"center",gap:12}}>
+                  <div style={{width:44,height:44,borderRadius:14,background:cat.color+"18",display:"grid",placeItems:"center",fontSize:22,flexShrink:0}}>{cat.icon}</div>
+                  <div style={{flex:1,minWidth:0}}>
+                    <div style={{fontSize:14,fontWeight:600,color:"var(--t1)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{e.desc||cat.name}{e.split?" · 👥":""}</div>
+                    <div style={{fontSize:12,color:"var(--t3)",marginTop:2}}>{cat.name}{e.note?` — ${e.note}`:""}{info.insufficient?" · ⚠ не хватает купленной валюты":""}</div>
+                  </div>
+                  {m&&<div title={m.name} style={{width:28,height:28,borderRadius:10,background:p.bg,color:p.text,display:"grid",placeItems:"center",fontSize:10,fontWeight:700,flexShrink:0}}>{m.name.slice(0,2).toUpperCase()}</div>}
+                  <div style={{textAlign:"right",flexShrink:0}}>
+                    <div style={{fontSize:16,fontWeight:800,whiteSpace:"nowrap",color:e.type==="income"?"var(--accent)":"var(--t1)"}}>{e.type==="income"?"+":"−"}{fmt(e.amount)} {cur.symbol}</div>
+                    {e.currency!=="RUB"&&<div style={{fontSize:10,color:"var(--t3)"}}>{fmt(info.rub)} ₽</div>}
+                  </div>
+                </div>
+              </C$>
+            </div>);
+          });})()}
+        </div>}
+
+        {tab==="currency"&&<CurrencyTab data={data} setData={setData}/>}
+
+        {tab==="debts"&&<DebtsTab data={data} setData={setData} rubMap={rubMap} dark={dark}/>}
+
+        {tab==="analytics"&&<div className="stack">
+          <CurSwitcher/>
+          <C$>
+            <label style={LS}>Период</label>
+            <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:anPeriod==="custom"?12:0}}>
+              {[["week","Неделя"],["month","Месяц"],["quarter","Квартал"],["year","Год"],["custom","Свой период"]].map(([v,l])=>(
+                <button key={v} onClick={()=>setAnPeriod(v)} style={{padding:"8px 14px",borderRadius:11,border:anPeriod===v?"2px solid var(--accent)":"1.5px solid var(--border)",background:anPeriod===v?"var(--accent-soft)":"var(--input)",color:anPeriod===v?"var(--accent)":"var(--t2)",cursor:"pointer",fontWeight:700,fontSize:12,fontFamily:"inherit"}}>{l}</button>
+              ))}
+            </div>
+            {anPeriod==="custom" && <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+              <div><label style={LS}>С</label><CalendarPicker value={anCustomFrom} onChange={setAnCustomFrom}/></div>
+              <div><label style={LS}>По</label><CalendarPicker value={anCustomTo} onChange={setAnCustomTo}/></div>
+            </div>}
+            <label style={{...LS,marginTop:14}}>Формат отображения</label>
+            <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+              {[["day","По дням"],["week","По неделям"],["month","По месяцам"]].map(([v,l])=>(
+                <button key={v} onClick={()=>setAnFormat(v)} style={{padding:"8px 14px",borderRadius:11,border:anFormat===v?"2px solid var(--accent)":"1.5px solid var(--border)",background:anFormat===v?"var(--accent-soft)":"var(--input)",color:anFormat===v?"var(--accent)":"var(--t2)",cursor:"pointer",fontWeight:700,fontSize:12,fontFamily:"inherit"}}>{l}</button>
+              ))}
+            </div>
+          </C$>
+
+          <div className="grid2">
+            <C$ className="stat-card"><div className="stat-label">Всего за период</div><div className="stat-value">{fmt(conv(anTotE))}<span className="stat-cur"> {dSym}</span></div></C$>
+            <C$ className="stat-card"><div className="stat-label">В среднем за день</div><div className="stat-value">{fmt(conv(anTotE/anDays))}<span className="stat-cur"> {dSym}</span></div></C$>
+          </div>
+
+          {anBuckets.length>0 && <C$><div style={{fontSize:14,fontWeight:700,color:"var(--t1)",marginBottom:12}}>Динамика</div>
+            <div style={{display:"flex",alignItems:"flex-end",gap:anFormat==="day"?2:8,height:100,overflowX:"auto",paddingBottom:2}}>
+              {anBuckets.map((b,i)=>{const mx=Math.max(...anBuckets.map(x=>x.value),1);
+                return <div key={i} title={`${b.label}: ${fmt(conv(b.value))} ${dSym}`} style={{flex:"0 0 auto",width:anFormat==="day"?6:32,height:`${Math.max(b.value/mx*100,3)}%`,background:"var(--accent)",borderRadius:3,opacity:b.value>0?.8:.25,transition:"height .5s"}}/>;
+              })}
+            </div>
+            {anFormat!=="day" && <div style={{display:"flex",gap:8,marginTop:6,fontSize:10,color:"var(--t3)"}}>{anBuckets.map((b,i)=><div key={i} style={{width:32,textAlign:"center"}}>{b.label}</div>)}</div>}
+          </C$>}
+
+          {anCatBD.length>0&&<C$><div style={{fontSize:14,fontWeight:700,color:"var(--t1)",marginBottom:14}}>Рейтинг категорий</div>
+            {anCatBD.map((c,i)=>(<div key={c.id} style={{display:"flex",alignItems:"center",gap:12,marginBottom:12}}>
+              <span style={{fontSize:13,fontWeight:800,color:"var(--t4)",width:22,textAlign:"right"}}>#{i+1}</span>
+              <div style={{width:36,height:36,borderRadius:10,background:c.color+"18",display:"grid",placeItems:"center",fontSize:18,flexShrink:0}}>{c.icon}</div>
+              <div style={{flex:1}}>
+                <div style={{display:"flex",justifyContent:"space-between",marginBottom:3}}><span style={{fontSize:13,fontWeight:600,color:"var(--t1)"}}>{c.name}</span><span style={{fontSize:13,fontWeight:700,color:"var(--t1)"}}>{fmt(conv(c.value))} {dSym} <span style={{fontWeight:500,color:"var(--t3)"}}>{pct(c.value,anTotE)}%</span></span></div>
+                <div style={{height:6,borderRadius:3,background:"var(--bg3)"}}><div style={{height:"100%",borderRadius:3,width:`${pct(c.value,anTotE)}%`,background:c.color,transition:"width .6s"}}/></div>
+              </div></div>))}
+          </C$>}
+
+          {anMemBD.length>1&&<C$><div style={{fontSize:14,fontWeight:700,color:"var(--t1)",marginBottom:14}}>Сравнение участников</div>
+            <div style={{display:"flex",justifyContent:"center",marginBottom:12}}><Donut slices={anMemBD.map(m=>({value:conv(m.value),color:m.color}))} label={fmt(conv(anTotE))} sub={`${dSym} всего`} size={150}/></div>
+            {anMemBD.map(m=>(<div key={m.id} style={{display:"flex",alignItems:"center",gap:10,marginBottom:8}}>
+              <div style={{width:10,height:10,borderRadius:4,background:m.color,flexShrink:0}}/><span style={{flex:1,fontSize:13,fontWeight:600,color:"var(--t1)"}}>{m.name}</span><span style={{fontSize:13,fontWeight:700,color:"var(--t1)"}}>{fmt(conv(m.value))} {dSym}</span><span style={{fontSize:11,color:"var(--t3)",width:35}}>{pct(m.value,anTotE)}%</span></div>))}
+          </C$>}
+
+          {!anCatBD.length&&<C$ style={{textAlign:"center",padding:48}}><div style={{fontSize:48,marginBottom:12,opacity:.6}}>📈</div><div style={{color:"var(--t3)",fontSize:15}}>Нет расходов за выбранный период</div></C$>}
+        </div>}
+      </div>
+      </div>
+
+      <button onClick={()=>setAddOpen(true)} className="fab">+</button>
+        </div>
+      </div>
+
+      <Modal open={addOpen} onClose={()=>setAddOpen(false)} title="Новая запись">
+        <ExpenseForm members={data.members} wallets={walletsList} defaultCurrency={data.settings?.defaultCurrency} onClose={()=>setAddOpen(false)} onSave={e=>setData(pr=>({...pr,expenses:[{...e,id:uid(),createdAt:Date.now()},...pr.expenses]}))}/>
+      </Modal>
+      <Modal open={!!editExp} onClose={()=>setEditExp(null)} title="Редактировать">
+        {editExp&&<ExpenseForm members={data.members} wallets={walletsList} expense={editExp} defaultCurrency={data.settings?.defaultCurrency} onClose={()=>setEditExp(null)} onSave={e=>setData(pr=>({...pr,expenses:pr.expenses.map(x=>x.id===e.id?{...x,...e}:x)}))} onDelete={id=>setData(pr=>({...pr,expenses:pr.expenses.filter(x=>x.id!==id)}))}/>}
+      </Modal>
+      <Modal open={stOpen} onClose={()=>setStOpen(false)} title="Настройки">
+        <Settings data={data} setData={setData} onClose={()=>setStOpen(false)} theme={theme} setTheme={setTheme}
+          syncUrl={syncUrl} setSyncUrl={setSyncUrl} syncStatus={syncStatus}
+          onSyncNow={async()=>{
+            if(!syncUrl) return;
+            setSyncStatus(s=>({...s,state:"syncing"}));
+            try{ const remote=await syncPull(syncUrl); if(remote&&Array.isArray(remote.members)) setData(remote); setSyncStatus({state:"ok",time:Date.now(),error:null}); }
+            catch(err){ setSyncStatus({state:"error",time:null,error:String(err.message||err)}); }
+          }}/>
+      </Modal>
+    </div>
+    </ThemeCtx.Provider>
+  );
+}
+
+/* ═══ CSS ═══ */
+const CSS=`
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+:root {
+  --bg0:#F6F7F8; --bg1:#fff; --bg2:#FAFBFB; --bg3:#EEF0F2;
+  --card:#fff; --card-sh:0 1px 2px rgba(16,24,40,.04);
+  --input:#fff; --border:#E3E6EA;
+  --t1:#171A1F; --t2:#5B6470; --t3:#8A93A0; --t4:#CBD1D8;
+  --accent:#0B6E4F; --accent-soft:#E6F4EE; --accent-glow:rgba(11,110,79,.16);
+  --danger:#B3392B; --danger-soft:#FBEBE8;
+}
+.dark {
+  --bg0:#12151A; --bg1:#181C22; --bg2:#1D2129; --bg3:#262B34;
+  --card:#181C22; --card-sh:0 1px 2px rgba(0,0,0,.3);
+  --input:#1D2129; --border:#2B313B;
+  --t1:#EDEFF2; --t2:#9BA3AF; --t3:#6E7684; --t4:#454C57;
+  --accent:#28A57C; --accent-soft:rgba(40,165,124,.14); --accent-glow:rgba(40,165,124,.22);
+  --danger:#D9695B; --danger-soft:rgba(217,105,91,.12);
+}
+
+*{box-sizing:border-box;margin:0;}
+body{font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;-webkit-font-smoothing:antialiased;}
+button{-webkit-tap-highlight-color:transparent;font-family:inherit;}
+input:focus{border-color:var(--accent) !important;box-shadow:0 0 0 3px var(--accent-glow) !important;outline:none;}
+
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+@keyframes slideUp{from{transform:translateY(100%)}to{transform:translateY(0)}}
+@keyframes calOpen{from{opacity:0;transform:translateY(-8px) scale(.97)}to{opacity:1;transform:translateY(0) scale(1)}}
+
+::-webkit-scrollbar{width:4px;height:4px;}
+::-webkit-scrollbar-track{background:transparent;}
+::-webkit-scrollbar-thumb{background:var(--bg3);border-radius:4px;}
+
+.app-shell{display:flex;min-height:100vh;}
+
+/* — Боковая навигация (десктоп ≥900px), как в веб-версии Monarch — */
+.sidebar{width:232px;flex-shrink:0;background:var(--card);border-right:1px solid var(--border);padding:20px 14px;display:none;flex-direction:column;position:sticky;top:0;height:100vh;}
+.sidebar-brand{display:flex;align-items:center;gap:10px;padding:6px 10px 22px;}
+.sidebar-nav{display:flex;flex-direction:column;gap:2px;flex:1;}
+.sidebar-item{display:flex;align-items:center;gap:12px;padding:10px 12px;border-radius:8px;border:none;background:transparent;color:var(--t2);font-weight:600;font-size:13.5px;cursor:pointer;text-align:left;width:100%;transition:background .15s,color .15s;}
+.sidebar-item:hover{background:var(--bg2);}
+.sidebar-item.active{background:var(--accent-soft);color:var(--accent);}
+.sidebar-item .ico{font-size:16px;width:20px;text-align:center;}
+
+.main{flex:1;min-width:0;}
+
+.header{background:var(--card);padding:16px 24px;position:sticky;top:0;z-index:100;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border);transition:background .3s;}
+
+.btn-icon{background:var(--bg2);border:1px solid var(--border);border-radius:8px;width:34px;height:34px;cursor:pointer;font-size:14px;color:var(--t2);display:grid;place-items:center;transition:background .2s;}
+.btn-icon:hover{background:var(--bg3);}
+
+.btn-primary{padding:11px 20px;border-radius:8px;border:none;cursor:pointer;font-weight:600;font-size:14px;background:var(--accent);color:#fff;width:100%;font-family:inherit;transition:opacity .2s;}
+.btn-primary:hover{opacity:.92;}
+
+.btn-add{display:flex;align-items:center;gap:6px;padding:9px 16px;border-radius:8px;border:none;cursor:pointer;font-weight:600;font-size:13px;background:var(--accent);color:#fff;font-family:inherit;transition:opacity .2s;white-space:nowrap;}
+.btn-add:hover{opacity:.92;}
+
+.month-input{padding:9px 12px;border-radius:8px;border:1px solid var(--border);background:var(--card);color:var(--t1);font-size:13.5px;font-weight:600;font-family:inherit;transition:background .3s, color .3s;}
+.month-input::-webkit-calendar-picker-indicator{filter:var(--t3);}
+
+.filter-badge{padding:6px 12px;border-radius:8px;font-size:12px;font-weight:600;display:flex;align-items:center;gap:4px;}
+
+/* — Нижний таб-бар (мобайл <900px) — */
+.tab-bar{display:inline-flex;gap:2px;background:var(--card);border-radius:10px;padding:3px;border:1px solid var(--border);transition:background .3s;}
+.tab-btn{padding:9px 16px;border-radius:7px;border:none;cursor:pointer;font-weight:600;font-size:12.5px;white-space:nowrap;background:transparent;color:var(--t3);transition:all .2s;}
+.tab-btn.active{background:var(--accent);color:#fff;}
+
+.stack{display:flex;flex-direction:column;gap:12px;}
+.grid3{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;}
+
+.stat-card{position:relative;overflow:hidden;}
+.stat-label{font-size:12px;font-weight:600;color:var(--t3);margin-bottom:8px;}
+.stat-value{font-size:25px;font-weight:700;color:var(--t1);letter-spacing:-.01em;line-height:1.1;font-variant-numeric:tabular-nums;}
+.stat-cur{font-size:15px;font-weight:600;opacity:.55;}
+
+.accent-card{background:var(--accent) !important;box-shadow:none !important;border-color:var(--accent) !important;}
+.accent-badge{display:inline-flex;align-items:center;gap:4px;font-size:11px;margin-top:4px;padding:3px 8px;border-radius:6px;background:rgba(255,255,255,.18);color:#fff;font-weight:600;}
+
+.fab{position:fixed;bottom:22px;right:22px;width:52px;height:52px;border-radius:10px;background:var(--accent);color:#fff;border:none;cursor:pointer;font-size:26px;font-weight:400;box-shadow:0 4px 14px rgba(16,24,40,.18);display:grid;place-items:center;z-index:90;transition:transform .2s,box-shadow .2s;}
+.fab:hover{transform:translateY(-2px);}
+.fab:active{transform:scale(.95);}
+
+.modal-box{border-radius:20px 20px 0 0;}
+@media(min-width:640px){
+  .modal-overlay{align-items:center !important;}
+  .modal-box{border-radius:14px !important;max-height:85vh !important;}
+}
+
+@media(min-width:900px){
+  .sidebar{display:flex;}
+  .mobile-tabs{display:none !important;}
+  .fab{display:none;}
+  .main-inner{max-width:880px;margin:0 auto;padding:28px 32px 60px;}
+}
+@media(max-width:899px){
+  .main-inner{padding:0;}
+}
+@media(max-width:480px){
+  .stat-value{font-size:21px;}
+  .grid3{grid-template-columns:1fr;}
+  .header{padding:12px 16px;}
+  .content{padding:0 16px !important;}
+}
+`;
+
+ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App));
+</script>
+</body>
+</html>

@@ -941,11 +941,50 @@ function EnvelopesCard({categoryBudgets, catBD, conv, dSym}){
   );
 }
 
+function emptyData(){
+  return {members:[],expenses:[],purchases:[],budget:50000,goal:10000,warn:80,categoryBudgets:{},settings:{defaultCurrency:"RUB",displayCurrency:"RUB"}};
+}
+// Приводит ЛЮБОЙ пришедший объект (из localStorage или с сервера синхронизации) к безопасной,
+// гарантированно корректной форме — никогда не бросает исключение, никогда не роняет рендер.
+function normalizeData(input){
+  try{
+    if(!input || typeof input !== "object") return emptyData();
+    const d = {...input};
+    if (d.expenses && !Array.isArray(d.expenses)) d.expenses = Object.values(d.expenses);
+    if (!Array.isArray(d.expenses)) d.expenses = [];
+    if (d.members && !Array.isArray(d.members)) d.members = Object.values(d.members);
+    if (!Array.isArray(d.members)) d.members = [];
+    if (!Array.isArray(d.purchases)) d.purchases = [];
+    d.members = d.members.filter(m=>m && m.id);
+    d.expenses = d.expenses.filter(e=>e && e.id).map(e=>({...e, currency: e.currency||"RUB"}));
+    d.purchases = d.purchases.filter(p=>p && p.id).map(p=>{
+      if (p.midCurrency !== undefined) return p; // уже новая схема
+      if (p.rateUsdRub !== undefined) { // миграция со старой схемы (промежуточная валюта всегда была USD)
+        if (p.currency === "USD") return { ...p, midCurrency:"RUB", rateDirect: p.rateUsdRub||0, rateMidRub:null, rateCurPerMid:null };
+        return { ...p, midCurrency:"USD", rateMidRub:p.rateUsdRub, rateCurPerMid:p.rateCurPerUsd, rateDirect:null };
+      }
+      return p;
+    });
+    if (typeof d.budget !== "number") d.budget = 50000;
+    if (typeof d.goal !== "number") d.goal = 10000;
+    if (typeof d.warn !== "number") d.warn = 80;
+    if (!d.settings || typeof d.settings !== "object") d.settings = {};
+    d.settings = {defaultCurrency:"RUB",displayCurrency:"RUB",...d.settings};
+    if (!d.categoryBudgets || typeof d.categoryBudgets !== "object") d.categoryBudgets = {};
+    return d;
+  }catch(e){
+    return emptyData();
+  }
+}
+
 /* ═══ Синхронизация через Google Таблицу (Apps Script как бесплатный JSON-бэкенд) ═══ */
 async function syncPull(url) {
   const res = await fetch(url, {cache:"no-store"});
-  if (!res.ok) throw new Error("pull failed: "+res.status);
-  return res.json();
+  if (!res.ok) throw new Error("сервер ответил ошибкой "+res.status);
+  let json;
+  try { json = await res.json(); }
+  catch(e){ throw new Error("сервер вернул не JSON — проверьте, что в Apps Script доступ выставлен на «Anyone», а ссылка заканчивается на /exec"); }
+  return json;
 }
 async function syncPush(url, data) {
   // text/plain — чтобы избежать CORS-preflight (Apps Script не обрабатывает OPTIONS по умолчанию)
@@ -975,7 +1014,17 @@ function App(){
   const[anFormat,setAnFormat]=useState("day");
   const[syncUrl,setSyncUrlState]=useState(()=>{try{return localStorage.getItem("fam-budget-sync-url")||"";}catch{return"";}});
   const[syncStatus,setSyncStatus]=useState({state:"idle",time:null,error:null}); // idle|syncing|ok|error
-  const setSyncUrl = url => { setSyncUrlState(url); try{ url ? localStorage.setItem("fam-budget-sync-url",url) : localStorage.removeItem("fam-budget-sync-url"); }catch{} };
+  const didInitialSync = useRef(false);
+  const syncReady = useRef(false); // true только после подтверждённого первого подключения к общей таблице — до этого пуш ЗАПРЕЩЁН
+  const[syncRetryTick,setSyncRetryTick]=useState(0);
+  const retrySync = () => { didInitialSync.current = false; setSyncRetryTick(t=>t+1); };
+  const setSyncUrl = url => {
+    didInitialSync.current = false;
+    syncReady.current = false;
+    setSyncStatus({state:"idle",time:null,error:null});
+    setSyncUrlState(url);
+    try{ url ? localStorage.setItem("fam-budget-sync-url",url) : localStorage.removeItem("fam-budget-sync-url"); }catch{}
+  };
   const lastEditRef = useRef(0);
   const pushTimerRef = useRef(null);
   const ok=useRef(false);
@@ -984,32 +1033,11 @@ function App(){
   useEffect(()=>{
     try {
       const raw = localStorage.getItem("fam-budget-local");
-      if (raw) {
-        const d = JSON.parse(raw);
-        if (d.expenses && !Array.isArray(d.expenses)) d.expenses = Object.values(d.expenses);
-        if (!d.expenses) d.expenses = [];
-        if (d.members && !Array.isArray(d.members)) d.members = Object.values(d.members);
-        if (!d.members) d.members = [];
-        if (!Array.isArray(d.purchases)) d.purchases = [];
-        d.purchases = d.purchases.map(p=>{
-          if (p.midCurrency !== undefined) return p; // уже новая схема
-          if (p.rateUsdRub !== undefined) { // миграция со старой схемы (промежуточная валюта всегда была USD)
-            if (p.currency === "USD") return { ...p, midCurrency:"RUB", rateDirect: p.rateUsdRub||0, rateMidRub:null, rateCurPerMid:null };
-            return { ...p, midCurrency:"USD", rateMidRub:p.rateUsdRub, rateCurPerMid:p.rateCurPerUsd, rateDirect:null };
-          }
-          return p;
-        });
-        if (!d.budget) d.budget = 50000;
-        if (!d.settings) d.settings = { defaultCurrency:"RUB", displayCurrency:"RUB" };
-        if (!d.categoryBudgets) d.categoryBudgets = {};
-        d.expenses.forEach(e=>{ if(!e.currency) e.currency="RUB"; });
-        setData(d);
-        if (d.theme) setTheme(d.theme);
-      } else {
-        setData({members:[],expenses:[],purchases:[],budget:50000,goal:10000,warn:80,categoryBudgets:{},settings:{defaultCurrency:"RUB",displayCurrency:"RUB"}});
-      }
+      const parsed = raw ? JSON.parse(raw) : null;
+      setData(normalizeData(parsed));
+      if (parsed && parsed.theme) setTheme(parsed.theme);
     } catch {
-      setData({members:[],expenses:[],purchases:[],budget:50000,goal:10000,warn:80,categoryBudgets:{},settings:{defaultCurrency:"RUB",displayCurrency:"RUB"}});
+      setData(emptyData());
     }
     ok.current = true;
   },[]);
@@ -1018,7 +1046,7 @@ function App(){
     if (!ok.current || !data) return;
     try { localStorage.setItem("fam-budget-local", JSON.stringify({...data, theme})); } catch {}
     lastEditRef.current = Date.now();
-    if (!syncUrl) return;
+    if (!syncUrl || !syncReady.current) return; // не отправляем ничего, пока не подтверждено первое подключение — это и защищает общие данные от перезаписи
     clearTimeout(pushTimerRef.current);
     pushTimerRef.current = setTimeout(async ()=>{
       setSyncStatus(s=>({...s,state:"syncing"}));
@@ -1027,35 +1055,36 @@ function App(){
     }, 1200);
   },[data, theme]);
 
-  // первичная синхронизация — выполняется РОВНО один раз, и только когда data гарантированно уже загружена из localStorage
-  const didInitialSync = useRef(false);
+  // первичная синхронизация — выполняется РОВНО один раз на каждую новую ссылку, и только когда data гарантированно уже загружена из localStorage
   useEffect(()=>{
     if (!syncUrl || !data || didInitialSync.current) return;
     didInitialSync.current = true;
     (async ()=>{
       setSyncStatus(s=>({...s,state:"syncing"}));
       try {
-        const remote = await syncPull(syncUrl);
-        if (remote && Array.isArray(remote.members)) {
-          const remoteEmpty = remote.members.length===0 && (!remote.expenses||!remote.expenses.length);
-          const localHasData = data.members.length>0 || data.expenses.length>0;
-          if (remoteEmpty && localHasData) await syncPush(syncUrl, data); // таблица пустая — инициализируем текущими данными
-          else setData(remote);
-        }
+        const remoteRaw = await syncPull(syncUrl);
+        if (!remoteRaw || typeof remoteRaw !== "object") throw new Error("сервер вернул пустой ответ");
+        const remote = normalizeData(remoteRaw);
+        const remoteEmpty = remote.members.length===0 && remote.expenses.length===0;
+        const localHasData = data.members.length>0 || data.expenses.length>0;
+        if (remoteEmpty && localHasData) await syncPush(syncUrl, data); // таблица пустая — инициализируем текущими данными
+        else setData(remote);
+        syncReady.current = true; // подключение подтверждено — теперь пуши разрешены
         setSyncStatus({state:"ok",time:Date.now(),error:null});
       } catch(err){ setSyncStatus({state:"error",time:null,error:String(err.message||err)}); }
     })();
-  },[syncUrl, data]);
+  },[syncUrl, data, syncRetryTick]);
 
   // подтягиваем актуальные данные при возврате в приложение (фокус вкладки/окна)
   useEffect(()=>{
     if (!syncUrl) return;
     const pull = async () => {
+      if (!syncReady.current) return; // ждём завершения первичного подключения
       if (Date.now()-lastEditRef.current < 3000) return; // не перетираем только что введённое
       setSyncStatus(s=>({...s,state:"syncing"}));
       try {
-        const remote = await syncPull(syncUrl);
-        if (remote && Array.isArray(remote.members)) setData(remote);
+        const remoteRaw = await syncPull(syncUrl);
+        if (remoteRaw && typeof remoteRaw === "object") setData(normalizeData(remoteRaw));
         setSyncStatus({state:"ok",time:Date.now(),error:null});
       } catch(err){ setSyncStatus({state:"error",time:null,error:String(err.message||err)}); }
     };
@@ -1123,7 +1152,27 @@ function App(){
         </div>
         </ThemeCtx.Provider>
       );
-      // синхронизация завершилась (успешно или с ошибкой), а участников всё ещё нет — переходим к созданию с нуля
+      if (syncStatus.state === "error") return(
+        <ThemeCtx.Provider value={dark}>
+        <div className={dark?"dark":""} style={{minHeight:"100vh",background:"var(--bg0)",display:"grid",placeItems:"center",padding:20}}>
+          <style>{CSS}</style>
+          <div style={{maxWidth:420,width:"100%",textAlign:"center"}}>
+            <div style={{fontSize:40,marginBottom:12}}>⚠️</div>
+            <h1 style={{fontSize:20,fontWeight:800,marginBottom:8,color:"var(--t1)"}}>Не удалось подключиться</h1>
+            <p style={{color:"var(--t3)",fontSize:13,lineHeight:1.6,marginBottom:20}}>{syncStatus.error}</p>
+            <C$ style={{textAlign:"left",marginBottom:14}}>
+              <div style={{fontSize:12,color:"var(--t2)",lineHeight:1.6}}>
+                Скорее всего дело в правах доступа Apps Script. Проверьте: в настройках развёртывания «Who has access» должно быть выставлено <b>Anyone</b> (не «Anyone with Google account»), а ссылка — заканчиваться на <b>/exec</b>.
+                <br/><br/>Ваши данные не пострадали — приложение ничего не отправляло на сервер, пока подключение не подтвердилось.
+              </div>
+            </C$>
+            <button onClick={retrySync} className="btn-primary" style={{marginBottom:10}}>Повторить попытку</button>
+            <button onClick={()=>{setSyncUrl("");}} style={{background:"none",border:"none",color:"var(--t3)",fontSize:13,fontWeight:600,cursor:"pointer",fontFamily:"inherit",textDecoration:"underline"}}>Отключить синхронизацию и начать локально</button>
+          </div>
+        </div>
+        </ThemeCtx.Provider>
+      );
+      // синхронизация прошла успешно, а участников в общей таблице действительно ещё нет — создаём с нуля
       return(
         <ThemeCtx.Provider value={dark}>
         <div className={dark?"dark":""} style={{minHeight:"100vh",background:"var(--bg0)",display:"grid",placeItems:"center",padding:20}}>
@@ -1363,8 +1412,12 @@ function App(){
           onSyncNow={async()=>{
             if(!syncUrl) return;
             setSyncStatus(s=>({...s,state:"syncing"}));
-            try{ const remote=await syncPull(syncUrl); if(remote&&Array.isArray(remote.members)) setData(remote); setSyncStatus({state:"ok",time:Date.now(),error:null}); }
-            catch(err){ setSyncStatus({state:"error",time:null,error:String(err.message||err)}); }
+            try{
+              const remoteRaw = await syncPull(syncUrl);
+              if(remoteRaw && typeof remoteRaw==="object") setData(normalizeData(remoteRaw));
+              syncReady.current = true;
+              setSyncStatus({state:"ok",time:Date.now(),error:null});
+            } catch(err){ setSyncStatus({state:"error",time:null,error:String(err.message||err)}); }
           }}/>
       </Modal>
     </div>

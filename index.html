@@ -355,6 +355,28 @@ function CalendarPicker({value,onChange}){
 }
 
 /* ═══ Onboarding ═══ */
+/* ═══ SyncGate — экран перед онбордингом: подключиться к общим данным по ссылке синхронизации ═══ */
+function SyncGate({onConnect, onSkip, connecting, error}){
+  const[url,setUrl]=useState("");
+  const ok = url.trim().startsWith("https://script.google.com/");
+  return(
+    <div style={{maxWidth:460,width:"100%",textAlign:"center"}}>
+      <div style={{width:72,height:72,borderRadius:20,background:"var(--accent)",display:"grid",placeItems:"center",margin:"0 auto 16px",boxShadow:"0 8px 24px var(--accent-glow)"}}>
+        <span style={{fontSize:32,filter:"brightness(10)"}}>💰</span>
+      </div>
+      <h1 style={{fontSize:28,fontWeight:800,marginBottom:4,color:"var(--t1)",letterSpacing:"-.03em"}}>Семейный бюджет</h1>
+      <p style={{color:"var(--t3)",marginBottom:32,fontSize:14,lineHeight:1.6}}>Если вам прислали ссылку синхронизации — вставьте её, и все общие данные подгрузятся автоматически</p>
+      <C$ style={{textAlign:"left"}}>
+        <label style={LS}>Ссылка синхронизации</label>
+        <input value={url} onChange={e=>setUrl(e.target.value)} placeholder="https://script.google.com/macros/s/.../exec" style={IS}/>
+        {error && <div style={{fontSize:12,color:"var(--danger)",marginTop:8}}>Не удалось подключиться: {error}</div>}
+        <button disabled={!ok||connecting} onClick={()=>onConnect(url.trim())} className="btn-primary" style={{marginTop:16,opacity:(ok&&!connecting)?1:.5}}>{connecting?"Подключаемся…":"Подключиться и загрузить данные"}</button>
+      </C$>
+      <button onClick={onSkip} style={{marginTop:14,background:"none",border:"none",color:"var(--t3)",fontSize:13,fontWeight:600,cursor:"pointer",fontFamily:"inherit",textDecoration:"underline"}}>У меня нет ссылки — начать с чистого листа</button>
+    </div>
+  );
+}
+
 function Onboarding({onDone}){
   const[names,setNames]=useState(["",""]);
   const[budget,setBudget]=useState("50000");
@@ -944,6 +966,7 @@ function App(){
   const[addOpen,setAddOpen]=useState(false);
   const[editExp,setEditExp]=useState(null);
   const[stOpen,setStOpen]=useState(false);
+  const[gateDismissed,setGateDismissed]=useState(false);
   const[fM,setFM]=useState("all");
   const[fMo,setFMo]=useState(()=>{const n=new Date();return`${n.getFullYear()}-${String(n.getMonth()+1).padStart(2,"0")}`;});
   const[anPeriod,setAnPeriod]=useState("month");
@@ -1089,14 +1112,44 @@ function App(){
 
   if(!data) return <div className={dark?"dark":""} style={{display:"grid",placeItems:"center",height:"100vh",background:"var(--bg0)"}}><style>{CSS}</style><p style={{color:"var(--t3)"}}>Загрузка...</p></div>;
 
-  if(!data.members.length) return(
-    <ThemeCtx.Provider value={dark}>
-    <div className={dark?"dark":""} style={{minHeight:"100vh",background:"var(--bg0)",display:"grid",placeItems:"center",padding:20}}>
-      <style>{CSS}</style>
-      <Onboarding onDone={(names,budget)=>setData({members:names.map((n,i)=>({id:uid(),name:n,ci:i%6})),expenses:[],purchases:[],budget,goal:10000,warn:80,categoryBudgets:{},settings:{defaultCurrency:"RUB",displayCurrency:"RUB"}})}/>
-    </div>
-    </ThemeCtx.Provider>
-  );
+  if(!data.members.length) {
+    // ссылка синхронизации уже задана — ждём результата первичной подтяжки данных, не мигаем онбордингом раньше времени
+    if (syncUrl) {
+      if (syncStatus.state === "syncing" || syncStatus.state === "idle") return(
+        <ThemeCtx.Provider value={dark}>
+        <div className={dark?"dark":""} style={{minHeight:"100vh",background:"var(--bg0)",display:"grid",placeItems:"center",padding:20}}>
+          <style>{CSS}</style>
+          <div style={{textAlign:"center",color:"var(--t3)",fontSize:14}}>Подключаемся к общим данным…</div>
+        </div>
+        </ThemeCtx.Provider>
+      );
+      // синхронизация завершилась (успешно или с ошибкой), а участников всё ещё нет — переходим к созданию с нуля
+      return(
+        <ThemeCtx.Provider value={dark}>
+        <div className={dark?"dark":""} style={{minHeight:"100vh",background:"var(--bg0)",display:"grid",placeItems:"center",padding:20}}>
+          <style>{CSS}</style>
+          <Onboarding onDone={(names,budget)=>setData({members:names.map((n,i)=>({id:uid(),name:n,ci:i%6})),expenses:[],purchases:[],budget,goal:10000,warn:80,categoryBudgets:{},settings:{defaultCurrency:"RUB",displayCurrency:"RUB"}})}/>
+        </div>
+        </ThemeCtx.Provider>
+      );
+    }
+    if (!gateDismissed) return(
+      <ThemeCtx.Provider value={dark}>
+      <div className={dark?"dark":""} style={{minHeight:"100vh",background:"var(--bg0)",display:"grid",placeItems:"center",padding:20}}>
+        <style>{CSS}</style>
+        <SyncGate connecting={syncStatus.state==="syncing"} error={syncStatus.state==="error"?syncStatus.error:null} onConnect={setSyncUrl} onSkip={()=>setGateDismissed(true)}/>
+      </div>
+      </ThemeCtx.Provider>
+    );
+    return(
+      <ThemeCtx.Provider value={dark}>
+      <div className={dark?"dark":""} style={{minHeight:"100vh",background:"var(--bg0)",display:"grid",placeItems:"center",padding:20}}>
+        <style>{CSS}</style>
+        <Onboarding onDone={(names,budget)=>setData({members:names.map((n,i)=>({id:uid(),name:n,ci:i%6})),expenses:[],purchases:[],budget,goal:10000,warn:80,categoryBudgets:{},settings:{defaultCurrency:"RUB",displayCurrency:"RUB"}})}/>
+      </div>
+      </ThemeCtx.Provider>
+    );
+  }
 
   const gm=id=>data.members.find(m=>m.id===id);
   const gp=m=>gpal(m,dark);
